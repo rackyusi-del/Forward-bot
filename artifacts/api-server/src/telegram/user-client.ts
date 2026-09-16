@@ -45,12 +45,22 @@ export class TelegramUserClient {
       );
 
       await client.start({
-        phoneNumber: async () =>
-          prompt("Send your Telegram phone number with country code. This message will be deleted immediately:"),
-        phoneCode: async () =>
-          prompt("Send the Telegram verification code. This message will be deleted immediately:"),
+        phoneNumber: async () => {
+          const phoneNumber = await prompt(
+            "📱 Send your Telegram phone number with country code.\n\nExample: +919876543210\n\n🔒 This message will be deleted immediately.",
+          );
+          return phoneNumber.replace(/\s+/g, "");
+        },
+        phoneCode: async () => {
+          const phoneCode = await prompt(
+            "🔢 Send the Telegram verification code.\n\nEnter it like this: 1 2 3 4 5\n(Spaces will be removed automatically.)\n\n🔒 This message will be deleted immediately.",
+          );
+          return phoneCode.replace(/\s+/g, "");
+        },
         password: async () =>
-          prompt("Send your Telegram 2FA password. This message will be deleted immediately:"),
+          prompt(
+            "🔐 Send your Telegram 2FA password.\n\n🔒 This message will be deleted immediately.",
+          ),
         onError: (error) => logger.warn({ err: error }, "Telegram login attempt failed"),
       });
 
