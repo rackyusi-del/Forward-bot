@@ -10,6 +10,12 @@ import {
 import type { TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from "./types";
 import { TelegramUserClient } from "./user-client";
 import { parseTelegramSourceUrl } from "./url";
+import {
+  languageLabel,
+  languageOptions,
+  type LanguageCode,
+  translate,
+} from "./i18n";
 
 const contentButtons: Array<{ text: string; value: ContentType }> = [
   { text: "Files", value: "files" },
@@ -52,6 +58,7 @@ class ForwardingBot {
   private stopping = false;
   private readonly pendingInputs = new Map<number, PendingInput>();
   private readonly transferLoops = new Set<number>();
+  private readonly scheduleTimers = new Map<number, NodeJS.Timeout>();
 
   constructor(
     private readonly api: TelegramApi,
@@ -62,6 +69,32 @@ class ForwardingBot {
   async run(): Promise<void> {
     await this.state.load();
     const bot = await this.api.getMe();
+    await this.api
+      .setMyCommands([
+        { command: "start", description: "Show help" },
+        { command: "login", description: "Connect Telegram account" },
+        { command: "transferspeed", description: "Choose transfer speed" },
+        { command: "queue", description: "Show current queue" },
+        { command: "status", description: "Show transfer status" },
+        { command: "history", description: "Show transfer history" },
+        { command: "stats", description: "Show transfer statistics" },
+        { command: "logs", description: "Show recent errors" },
+        { command: "retry", description: "Retry failed items" },
+        { command: "skip", description: "Skip next pending item" },
+        { command: "stop", description: "Pause transfer" },
+        { command: "resume", description: "Resume transfer" },
+        { command: "cancel", description: "Cancel current queue" },
+        { command: "filter", description: "Filter source items" },
+        { command: "maxsize", description: "Set maximum file size" },
+        { command: "schedule", description: "Schedule a transfer" },
+        { command: "notify", description: "Toggle completion notifications" },
+        { command: "destination", description: "Show current destination" },
+        { command: "language", description: "Choose language" },
+        { command: "settings", description: "Show settings" },
+        { command: "privacy", description: "Show privacy information" },
+        { command: "ping", description: "Check bot status" },
+      ])
+      .catch((error) => logger.warn({ err: error }, "Could not register Telegram commands"));
     await this.api.deleteWebhook();
     logger.info(
       { username: bot.username ?? bot.first_name },
@@ -123,6 +156,196 @@ class ForwardingBot {
     const text = message.text?.trim() ?? "";
     const normalized = text.toLowerCase();
     const isPrivate = message.chat.type === "private";
+    const [command, ...args] = normalized.split(/\s+/);
+    const user = this.state.getUser(userId);
+
+    if (command === "/language") {
+      if (!isPrivate) {
+        await this.api.sendMessage(message.chat.id, "Use /language in the bot's private chat.");
+        return true;
+      }
+      await this.api.sendMessage(message.chat.id, translate(user.language, "languageChoose"), {
+        replyMarkup: this.languageKeyboard(user.language),
+      });
+      return true;
+    }
+
+    if (command === "/settings") {
+      await this.api.sendMessage(message.chat.id, translate(user.language, "settings", {
+        language: languageLabel(user.language),
+        speed: formatSpeed(user.transferSpeed),
+        notify: user.notifyOnComplete ? "on" : "off",
+        maxSize: user.maxFileSizeMb ? `${user.maxFileSizeMb} MB` : "unlimited",
+        filter: user.filterText ?? "none",
+      }));
+      return true;
+    }
+
+    if (command === "/queue") {
+      await this.api.sendMessage(message.chat.id, this.queueText(user));
+      return true;
+    }
+
+    if (command === "/retry" || command === "/retryall") {
+      await this.state.retryFailed(userId);
+      await this.api.sendMessage(message.chat.id, translate(user.language, "transferResumed"));
+      void this.startTransfer(userId, message.chat.id, message.message_thread_id);
+      return true;
+    }
+
+    if (command === "/skip") {
+      const skipped = await this.state.skipNext(userId);
+      await this.api.sendMessage(
+        message.chat.id,
+        skipped
+          ? translate(user.language, "skipDone", { name: skipped.name })
+          : translate(user.language, "queueEmpty"),
+      );
+      return true;
+    }
+
+    if (command === "/logout") {
+      await this.state.setRunning(userId, false);
+      await this.userClient.logout(userId);
+      await this.state.setAuthorized(userId, false);
+      await this.state.reset(userId);
+      await this.api.sendMessage(message.chat.id, translate(user.language, "logoutDone"));
+      return true;
+    }
+
+    if (command === "/destination") {
+      await this.api.sendMessage(message.chat.id, translate(user.language, "destination", {
+        destination: user.target?.title ?? (user.target ? String(user.target.chatId) : "not set"),
+      }));
+      return true;
+    }
+
+    if (command === "/pause") {
+      await this.state.setRunning(userId, false);
+      await this.api.sendMessage(message.chat.id, translate(user.language, "transferPaused"));
+      return true;
+    }
+
+    if (command === "/clear") {
+      await this.state.cancelQueue(userId);
+      await this.api.sendMessage(message.chat.id, translate(user.language, "queueCleared"));
+      return true;
+    }
+
+    if (command === "/speed") {
+      await this.api.sendMessage(
+        message.chat.id,
+        translate(user.language, "transferSpeed", { speed: formatSpeed(user.transferSpeed) }),
+        { replyMarkup: this.transferSpeedKeyboard(user.transferSpeed) },
+      );
+      return true;
+    }
+
+    if (command === "/ping") {
+      await this.api.sendMessage(message.chat.id, translate(user.language, "ping"));
+      return true;
+    }
+
+    if (command === "/privacy") {
+      await this.api.sendMessage(message.chat.id, translate(user.language, "privacy"));
+      return true;
+    }
+
+    if (command === "/history") {
+      await this.api.sendMessage(message.chat.id, this.historyText(user));
+      return true;
+    }
+
+    if (command === "/stats") {
+      const sent = user.history.reduce((total, item) => total + item.sent, 0);
+      const failed = user.history.reduce((total, item) => total + item.failed, 0);
+      await this.api.sendMessage(message.chat.id, translate(user.language, "stats", {
+        transfers: user.history.length,
+        sent,
+        failed,
+        duplicates: user.duplicateCount,
+      }));
+      return true;
+    }
+
+    if (command === "/logs") {
+      await this.api.sendMessage(message.chat.id, translate(user.language, "logs", {
+        items: user.lastError ?? "No recent errors",
+      }));
+      return true;
+    }
+
+    if (command === "/duplicates") {
+      await this.api.sendMessage(message.chat.id, translate(user.language, "duplicates", {
+        count: user.duplicateCount,
+      }));
+      return true;
+    }
+
+    if (command === "/filter") {
+      const value = args.join(" ").trim();
+      if (!value) {
+        await this.api.sendMessage(message.chat.id, translate(user.language, "filterUsage"));
+      } else if (value === "off" || value === "clear") {
+        await this.state.setFilter(userId, undefined);
+        await this.api.sendMessage(message.chat.id, translate(user.language, "filterCleared"));
+      } else {
+        await this.state.setFilter(userId, value);
+        await this.api.sendMessage(message.chat.id, translate(user.language, "filterSet", { filter: value }));
+      }
+      return true;
+    }
+
+    if (command === "/maxsize") {
+      const value = args[0];
+      if (!value) {
+        await this.api.sendMessage(message.chat.id, translate(user.language, "maxSizeUsage"));
+      } else if (value === "off" || value === "clear") {
+        await this.state.setMaxFileSize(userId, undefined);
+        await this.api.sendMessage(message.chat.id, translate(user.language, "maxSizeCleared"));
+      } else {
+        const size = Number(value);
+        if (!Number.isFinite(size) || size <= 0) {
+          await this.api.sendMessage(message.chat.id, translate(user.language, "maxSizeUsage"));
+        } else {
+          await this.state.setMaxFileSize(userId, size);
+          await this.api.sendMessage(message.chat.id, translate(user.language, "maxSizeSet", { size: Math.round(size) }));
+        }
+      }
+      return true;
+    }
+
+    if (command === "/notify") {
+      const value = args[0];
+      if (value !== "on" && value !== "off") {
+        await this.api.sendMessage(message.chat.id, "Usage: /notify on or /notify off");
+      } else {
+        await this.state.setNotifyOnComplete(userId, value === "on");
+        await this.api.sendMessage(message.chat.id, translate(user.language, "notifySet", {
+          state: value === "on" ? "on" : "off",
+        }));
+      }
+      return true;
+    }
+
+    if (command === "/schedule") {
+      const value = args[0];
+      if (!value) {
+        await this.api.sendMessage(message.chat.id, translate(user.language, "scheduleUsage"));
+      } else if (value === "off" || value === "clear") {
+        await this.clearSchedule(userId);
+        await this.api.sendMessage(message.chat.id, translate(user.language, "scheduleCleared"));
+      } else {
+        const minutes = Number(value);
+        if (!Number.isFinite(minutes) || minutes < 1 || minutes > 10080) {
+          await this.api.sendMessage(message.chat.id, translate(user.language, "scheduleUsage"));
+        } else {
+          await this.state.setScheduledAt(userId, new Date(Date.now() + minutes * 60_000).toISOString());
+          await this.api.sendMessage(message.chat.id, translate(user.language, "scheduleSet", { minutes: Math.round(minutes) }));
+        }
+      }
+      return true;
+    }
 
     if (normalized === "/myid" && isPrivate) {
       await this.api.sendMessage(message.chat.id, `Your Telegram ID is: ${userId}`);
@@ -130,7 +353,7 @@ class ForwardingBot {
     }
 
     if (normalized === "/start" || normalized === "/help") {
-      await this.api.sendMessage(message.chat.id, this.helpText());
+      await this.api.sendMessage(message.chat.id, this.helpText(user.language));
       return true;
     }
 
@@ -159,7 +382,7 @@ class ForwardingBot {
       }
       await this.api.sendMessage(
         message.chat.id,
-        `Transfer speed: ${formatSpeed(this.state.getUser(userId).transferSpeed)}\n🐢 Slow options: 0.1x–1x\n🚀 Fast options: 1x–10x`,
+        `${translate(user.language, "transferSpeed", { speed: formatSpeed(user.transferSpeed) })}\n🐢 Slow options: 0.1x–1x\n🚀 Fast options: 1x–10x`,
         { replyMarkup: this.transferSpeedKeyboard(this.state.getUser(userId).transferSpeed) },
       );
       return true;
@@ -167,7 +390,7 @@ class ForwardingBot {
 
     if (normalized === "/stop") {
       await this.state.setRunning(userId, false);
-      await this.api.sendMessage(message.chat.id, "Transfer paused. Use /resume to continue from the saved checkpoint.");
+      await this.api.sendMessage(message.chat.id, translate(user.language, "transferPaused"));
       return true;
     }
 
@@ -183,7 +406,7 @@ class ForwardingBot {
 
     if (normalized === "/cancel") {
       await this.state.cancelQueue(userId);
-      await this.api.sendMessage(message.chat.id, "Transfer cancelled and its queue was cleared.");
+      await this.api.sendMessage(message.chat.id, translate(user.language, "transferCancelled"));
       return true;
     }
 
@@ -206,7 +429,6 @@ class ForwardingBot {
         });
         return true;
       }
-      const user = this.state.getUser(userId);
       if (!user.authorized) {
         await this.api.sendMessage(message.chat.id, "Send /login first. Source history is read through your authorized Telegram account.");
         return true;
@@ -243,7 +465,42 @@ class ForwardingBot {
       title: message.chat.title,
       threadId: message.message_thread_id,
     });
+    const scheduledAt = user.scheduledAt ? Date.parse(user.scheduledAt) : NaN;
+    if (Number.isFinite(scheduledAt) && scheduledAt > Date.now()) {
+      await this.scheduleTransfer(userId, message.chat.id, message.message_thread_id, scheduledAt);
+      return;
+    }
+    await this.state.setScheduledAt(userId, undefined);
     await this.startTransfer(userId, message.chat.id, message.message_thread_id);
+  }
+
+  private async scheduleTransfer(
+    userId: number,
+    chatId: number,
+    threadId: number | undefined,
+    scheduledAt: number,
+  ): Promise<void> {
+    const existing = this.scheduleTimers.get(userId);
+    if (existing) clearTimeout(existing);
+    const delay = Math.max(0, scheduledAt - Date.now());
+    await this.api.sendMessage(
+      chatId,
+      `Transfer scheduled for ${new Date(scheduledAt).toLocaleString()}.`,
+      { threadId },
+    );
+    const timer = setTimeout(() => {
+      this.scheduleTimers.delete(userId);
+      void this.state.setScheduledAt(userId, undefined);
+      void this.startTransfer(userId, chatId, threadId);
+    }, delay);
+    this.scheduleTimers.set(userId, timer);
+  }
+
+  private async clearSchedule(userId: number): Promise<void> {
+    const timer = this.scheduleTimers.get(userId);
+    if (timer) clearTimeout(timer);
+    this.scheduleTimers.delete(userId);
+    await this.state.setScheduledAt(userId, undefined);
   }
 
   private consumePendingInput(message: TelegramMessage): boolean {
@@ -301,6 +558,22 @@ class ForwardingBot {
       return;
     }
 
+    if (data.startsWith("lang:")) {
+      const language = data.slice("lang:".length) as LanguageCode;
+      if (!languageOptions.some((option) => option.code === language)) {
+        await this.api.answerCallbackQuery(callback.id, "Unknown language");
+        return;
+      }
+      await this.state.setLanguage(userId, language);
+      await this.api.answerCallbackQuery(callback.id, "Language updated");
+      await this.api.sendMessage(
+        chatId,
+        translate(language, "languageSet", { language: languageLabel(language) }),
+        { replyMarkup: this.languageKeyboard(language) },
+      );
+      return;
+    }
+
     if (data.startsWith("type:")) {
       const type = data.slice("type:".length) as ContentType;
       if (!contentButtons.some((button) => button.value === type)) {
@@ -345,7 +618,11 @@ class ForwardingBot {
 
     try {
       await this.api.sendMessage(chatId, `Scanning ${contentLabel(type)} history...`);
-      const result = await this.userClient.discover(userId, source, type);
+      const user = this.state.getUser(userId);
+      const result = await this.userClient.discover(userId, source, type, {
+        filterText: user.filterText,
+        maxFileSizeMb: user.maxFileSizeMb,
+      });
       await this.state.setAvailable(userId, type, result.items);
       if (!result.items.length) {
         await this.api.sendMessage(chatId, `No ${contentLabel(type).toLowerCase()} were found in ${source.label}.`);
@@ -390,7 +667,7 @@ class ForwardingBot {
       await this.api.answerCallbackQuery(callback.id, "Queue created");
       await this.api.sendMessage(
         chatId,
-        `Queue ready: ${user.selectedIds.length} items.\nNow send .sendhere inside the exact destination group, channel or forum topic.`,
+        `Queue ready: ${user.queue.length} items.\nNow send .sendhere inside the exact destination group, channel or forum topic.`,
       );
       return;
     }
@@ -461,6 +738,7 @@ class ForwardingBot {
 
     this.transferLoops.add(userId);
     await this.state.setRunning(userId, true);
+    const shouldRecordHistory = initial.queue.some((item) => item.status !== "completed");
     try {
       const progress = await this.api.sendMessage(
         notifyChatId,
@@ -484,9 +762,23 @@ class ForwardingBot {
       if (finalUser.running) {
         await this.state.setRunning(userId, false);
         await this.updateProgress(userId);
-        await this.api.sendMessage(notifyChatId, this.summaryText(this.state.getUser(userId)), {
-          threadId: notifyThreadId,
-        });
+        if (shouldRecordHistory) {
+          const completed = finalUser.queue.filter((item) => item.status === "completed").length;
+          const failed = finalUser.queue.filter((item) => item.status === "failed").length;
+          await this.state.recordTransfer(userId, {
+            at: new Date().toISOString(),
+            destination: finalUser.target?.title ?? String(finalUser.target?.chatId ?? "unknown"),
+            total: finalUser.queue.length,
+            sent: completed,
+            failed,
+            speed: finalUser.transferSpeed,
+          });
+        }
+        if (finalUser.notifyOnComplete) {
+          await this.api.sendMessage(notifyChatId, this.summaryText(this.state.getUser(userId)), {
+            threadId: notifyThreadId,
+          });
+        }
       } else {
         await this.api.sendMessage(notifyChatId, "Transfer paused. Completed items are saved; use /resume to continue.", {
           threadId: notifyThreadId,
@@ -515,6 +807,7 @@ class ForwardingBot {
         const current = this.state.getUser(userId);
         await this.userClient.sendItem(userId, current.source!, current.target!, item);
         await this.state.setItemStatus(userId, item.id, "completed");
+        await this.state.markItemSent(userId, item);
       } catch (error) {
         await this.state.setItemStatus(userId, item.id, "failed", safeError(error));
         await this.state.setError(userId, safeError(error));
@@ -556,7 +849,7 @@ class ForwardingBot {
     const bar = `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
     return [
       "Sending queue...",
-      `Speed: ${user.transferSpeed}x`,
+      `Speed: ${formatSpeed(user.transferSpeed)}`,
       `[${bar}] ${completed}/${total}`,
       currentItem ? `Sending: ${currentItem.name}` : "Preparing next item...",
     ].join("\n");
@@ -603,6 +896,55 @@ class ForwardingBot {
     return { inline_keyboard: rows };
   }
 
+  private languageKeyboard(selectedLanguage: LanguageCode) {
+    const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+    for (let index = 0; index < languageOptions.length; index += 2) {
+      rows.push(
+        languageOptions.slice(index, index + 2).map((option) => ({
+          text: `${option.code === selectedLanguage ? "✓ " : ""}${option.label}`,
+          callback_data: `lang:${option.code}`,
+        })),
+      );
+    }
+    return { inline_keyboard: rows };
+  }
+
+  private queueText(user: UserState): string {
+    if (!user.queue.length) return translate(user.language, "queueEmpty");
+    const counts = {
+      completed: user.queue.filter((item) => item.status === "completed").length,
+      pending: user.queue.filter((item) => item.status === "pending").length,
+      processing: user.queue.filter((item) => item.status === "processing").length,
+      failed: user.queue.filter((item) => item.status === "failed").length,
+    };
+    const preview = user.queue
+      .filter((item) => item.status !== "completed")
+      .slice(0, 15)
+      .map((item, index) => `${index + 1}. ${item.name} — ${item.status}`)
+      .join("\n");
+    return [
+      `Queue: ${user.queue.length}`,
+      `Completed: ${counts.completed}`,
+      `Processing: ${counts.processing}`,
+      `Pending: ${counts.pending}`,
+      `Failed: ${counts.failed}`,
+      "",
+      preview || "All queued items are completed.",
+    ].join("\n");
+  }
+
+  private historyText(user: UserState): string {
+    if (!user.history.length) return translate(user.language, "noHistory");
+    const items = user.history
+      .slice(0, 10)
+      .map(
+        (record) =>
+          `${new Date(record.at).toLocaleString()} — ${record.destination}\nSent: ${record.sent}/${record.total}, failed: ${record.failed}, speed: ${formatSpeed(record.speed)}`,
+      )
+      .join("\n");
+    return translate(user.language, "history", { items });
+  }
+
   private selectionKeyboard(
     items: QueueItem[],
     selected: Set<string>,
@@ -634,9 +976,11 @@ class ForwardingBot {
     return { inline_keyboard: rows };
   }
 
-  private helpText(): string {
+  private helpText(language: LanguageCode): string {
     return [
       "Personal Telegram Transfer Bot",
+      "",
+      translate(language, "help"),
       "",
       "1. Send /login here and complete Telegram verification.",
       "2. Send a source group/channel URL.",
@@ -644,7 +988,8 @@ class ForwardingBot {
       "4. Select individual items or Select all, then Create queue.",
       "5. Send .sendhere inside the exact destination group, channel or forum topic.",
        "6. Use /transferspeed to choose one of 10 slow or 10 fast speeds.",
-       "7. Use /stop, /resume, /cancel or /status as needed.",
+      "7. Use /queue, /history, /stats, /settings and /logs.",
+      "8. Use /stop, /resume, /cancel or /status as needed.",
       "",
       "Every Telegram user has a separate session, source, destination and checkpoint.",
       "Only chats your authorized Telegram account can access are supported.",

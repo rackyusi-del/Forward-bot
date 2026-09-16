@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { logger } from "../lib/logger";
+import type { LanguageCode } from "./i18n";
 
 export type ContentType =
   | "files"
@@ -29,14 +30,32 @@ export interface QueueItem {
   type: ContentType;
   name: string;
   date: number;
+  size?: number;
   status: QueueItemStatus;
   error?: string;
+}
+
+export interface TransferHistory {
+  at: string;
+  destination: string;
+  total: number;
+  sent: number;
+  failed: number;
+  speed: number;
 }
 
 export interface UserState {
   userId: number;
   authorized: boolean;
   transferSpeed: number;
+  language: LanguageCode;
+  notifyOnComplete: boolean;
+  maxFileSizeMb?: number;
+  filterText?: string;
+  scheduledAt?: string;
+  duplicateCount: number;
+  sentItemKeys: string[];
+  history: TransferHistory[];
   source?: SourceConfig;
   contentType?: ContentType;
   available: QueueItem[];
@@ -65,6 +84,11 @@ const emptyUser = (userId: number): UserState => ({
   userId,
   authorized: false,
   transferSpeed: 1,
+  language: "en",
+  notifyOnComplete: true,
+  duplicateCount: 0,
+  sentItemKeys: [],
+  history: [],
   available: [],
   selectedIds: [],
   queue: [],
@@ -86,6 +110,11 @@ export class StateStore {
       this.state = JSON.parse(await readFile(this.statePath, "utf8")) as PersistedState;
       for (const user of Object.values(this.state.users)) {
         user.transferSpeed = normalizeTransferSpeed(user.transferSpeed);
+        user.language ??= "en";
+        user.notifyOnComplete ??= true;
+        user.duplicateCount ??= 0;
+        user.sentItemKeys ??= [];
+        user.history ??= [];
         user.running = false;
         for (const item of user.queue) {
           if (item.status === "processing") item.status = "pending";
@@ -144,6 +173,32 @@ export class StateStore {
     await this.save();
   }
 
+  async setLanguage(userId: number, language: LanguageCode) {
+    this.getUser(userId).language = language;
+    await this.save();
+  }
+
+  async setNotifyOnComplete(userId: number, enabled: boolean) {
+    this.getUser(userId).notifyOnComplete = enabled;
+    await this.save();
+  }
+
+  async setFilter(userId: number, filterText: string | undefined) {
+    this.getUser(userId).filterText = filterText?.trim() || undefined;
+    await this.save();
+  }
+
+  async setMaxFileSize(userId: number, maxFileSizeMb: number | undefined) {
+    this.getUser(userId).maxFileSizeMb =
+      maxFileSizeMb === undefined ? undefined : Math.max(1, Math.round(maxFileSizeMb));
+    await this.save();
+  }
+
+  async setScheduledAt(userId: number, scheduledAt: string | undefined) {
+    this.getUser(userId).scheduledAt = scheduledAt;
+    await this.save();
+  }
+
   async setSource(userId: number, source: SourceConfig) {
     const user = this.getUser(userId);
     user.source = source;
@@ -175,9 +230,43 @@ export class StateStore {
   async createQueue(userId: number) {
     const user = this.getUser(userId);
     const selected = new Set(user.selectedIds);
-    user.queue = user.available
-      .filter((item) => selected.has(item.id))
+    const sentKeys = new Set(user.sentItemKeys);
+    const sourceKey = user.source ? String(user.source.chatId) : "";
+    const selectedItems = user.available
+      .filter((item) => selected.has(item.id));
+    user.duplicateCount += selectedItems.filter((item) =>
+      sentKeys.has(`${sourceKey}:${item.messageId}`),
+    ).length;
+    user.queue = selectedItems
+      .filter((item) => !sentKeys.has(`${sourceKey}:${item.messageId}`))
       .map((item) => ({ ...item, status: "pending", error: undefined }));
+    await this.save();
+  }
+
+  async markItemSent(userId: number, item: QueueItem) {
+    const user = this.getUser(userId);
+    const sourceKey = user.source ? String(user.source.chatId) : "";
+    const key = `${sourceKey}:${item.messageId}`;
+    if (!user.sentItemKeys.includes(key)) {
+      user.sentItemKeys.push(key);
+      if (user.sentItemKeys.length > 10_000) user.sentItemKeys.splice(0, 1_000);
+    }
+    await this.save();
+  }
+
+  async skipNext(userId: number): Promise<QueueItem | undefined> {
+    const user = this.getUser(userId);
+    const index = user.queue.findIndex((item) => item.status === "pending");
+    if (index < 0) return undefined;
+    const [item] = user.queue.splice(index, 1);
+    await this.save();
+    return item;
+  }
+
+  async recordTransfer(userId: number, record: TransferHistory) {
+    const user = this.getUser(userId);
+    user.history.unshift(record);
+    user.history = user.history.slice(0, 20);
     await this.save();
   }
 
@@ -236,6 +325,7 @@ export class StateStore {
     user.selectedIds = [];
     user.target = undefined;
     user.progressMessage = undefined;
+    user.scheduledAt = undefined;
     await this.save();
   }
 
@@ -244,6 +334,9 @@ export class StateStore {
     this.state.users[String(userId)] = {
       ...emptyUser(userId),
       authorized: current.authorized,
+      language: current.language,
+      notifyOnComplete: current.notifyOnComplete,
+      transferSpeed: current.transferSpeed,
     };
     await this.save();
   }

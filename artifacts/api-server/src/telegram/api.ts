@@ -92,6 +92,10 @@ export class TelegramApi {
     return this.call<TelegramBot>("getMe");
   }
 
+  setMyCommands(commands: Array<{ command: string; description: string }>) {
+    return this.call<boolean>("setMyCommands", { commands });
+  }
+
   deleteWebhook() {
     return this.call<boolean>("deleteWebhook", { drop_pending_updates: false });
   }

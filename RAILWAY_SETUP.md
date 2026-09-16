@@ -51,7 +51,10 @@ chat permissions, Telegram rate limits, or sender identity restrictions.
 6. Send `/transferspeed` in the bot's private chat and choose one of the 10
    slower or 10 faster speed buttons.
 7. Send `.sendhere` in the destination chat or exact forum topic.
-8. Use `/status`, `/stop`, `/resume` and `/cancel` as needed.
+8. Use `/queue`, `/status`, `/history`, `/stats` and `/logs` to monitor the job.
+9. Use `/filter`, `/maxsize`, `/duplicates`, `/retry` and `/skip` to control it.
+10. Use `/schedule`, `/notify`, `/destination`, `/settings` and `/language`.
+11. Use `/stop`, `/resume`, `/cancel`, `/reset` and `/logout` as needed.
 
 The queue is persisted after every item state transition. Completed items are
 never selected again; failed items are retried only when `/resume` is used.

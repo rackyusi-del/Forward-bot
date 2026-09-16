@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
@@ -77,10 +77,20 @@ export class TelegramUserClient {
     this.clients.clear();
   }
 
+  async logout(userId: number): Promise<void> {
+    const client = this.clients.get(userId);
+    if (client) {
+      await client.disconnect();
+      this.clients.delete(userId);
+    }
+    await unlink(this.sessionPath(userId)).catch(() => undefined);
+  }
+
   async discover(
     userId: number,
     source: SourceConfig,
     type: ContentType,
+    options: { filterText?: string; maxFileSizeMb?: number } = {},
   ): Promise<DiscoveryResult> {
     const client = await this.getClient(userId);
     const sourceEntity = await client.getInputEntity(source.chatId);
@@ -92,13 +102,28 @@ export class TelegramUserClient {
       const messageId = Number(message.id);
       if (!Number.isSafeInteger(messageId) || seen.has(messageId)) continue;
       if (!matchesContentType(message, type)) continue;
+      const name = itemName(message, type, messageId);
+      const fileSize = Number(message.file?.size ?? 0);
+      if (
+        options.maxFileSizeMb !== undefined &&
+        fileSize > options.maxFileSizeMb * 1024 * 1024
+      ) {
+        continue;
+      }
+      if (
+        options.filterText &&
+        !name.toLowerCase().includes(options.filterText.toLowerCase())
+      ) {
+        continue;
+      }
       seen.add(messageId);
       items.push({
         id: String(messageId),
         messageId,
         type,
-        name: itemName(message, type, messageId),
+        name,
         date: Number(message.date ?? 0),
+        size: fileSize > 0 ? fileSize : undefined,
         status: "pending",
       });
       if (items.length >= maxItems) {
