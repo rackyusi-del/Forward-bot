@@ -1,0 +1,1 @@
+- [Telegram Bot API limits](telegram-bot-api-limits.md) — Bot API supports live updates and specific-message copies, not full chat-history backfill.
