@@ -861,10 +861,6 @@ class ForwardingBot {
           item,
           () => transferRun.cancelled,
         );
-        if (transferRun.cancelled) {
-          await this.state.setItemStatus(userId, item.id, "pending");
-          return;
-        }
         await this.state.setItemStatus(userId, item.id, "completed");
         await this.state.markItemSent(userId, item);
       } catch (error) {

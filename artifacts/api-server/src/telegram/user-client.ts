@@ -163,11 +163,13 @@ export class TelegramUserClient {
       try {
         if (item.type === "messages" && !message.media) {
           if (!message.message?.trim()) throw new Error("Message has no text");
+          if (isCancelled()) throw new Error("Transfer was stopped");
           await client.sendMessage(targetEntity, {
             message: message.message,
             replyTo: target.threadId,
           });
         } else if (message.media) {
+          if (isCancelled()) throw new Error("Transfer was stopped");
           await client.sendFile(targetEntity, {
             file: message.media,
             caption: message.message || undefined,
@@ -177,7 +179,6 @@ export class TelegramUserClient {
         } else {
           throw new Error("Source media is unavailable");
         }
-        if (isCancelled()) throw new Error("Transfer was stopped");
         return;
       } catch (error) {
         if (isCancelled()) throw error;
