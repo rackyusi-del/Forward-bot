@@ -31,11 +31,11 @@ export interface TelegramMessage {
   entities?: TelegramEntity[];
   caption?: string;
   caption_entities?: TelegramEntity[];
-  document?: { file_id: string };
+  document?: { file_id: string; file_name?: string; mime_type?: string };
   photo?: Array<{ file_id: string }>;
-  video?: { file_id: string };
-  animation?: { file_id: string };
-  audio?: { file_id: string };
+  video?: { file_id: string; file_name?: string };
+  animation?: { file_id: string; file_name?: string };
+  audio?: { file_id: string; file_name?: string };
   voice?: { file_id: string };
   video_note?: { file_id: string };
   sticker?: { file_id: string };

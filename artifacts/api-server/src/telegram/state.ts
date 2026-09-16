@@ -1,20 +1,20 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { logger } from "../lib/logger";
-import type { TelegramChat, TelegramMessage } from "./types";
 
-export type ContentFilter =
+export type ContentType =
   | "files"
   | "photos"
   | "videos"
+  | "voice"
   | "messages"
-  | "links"
-  | "everything";
+  | "other";
+
+export type QueueItemStatus = "pending" | "processing" | "completed" | "failed";
 
 export interface SourceConfig {
   chatId: number | string;
   label: string;
-  specificMessageId?: number;
 }
 
 export interface TargetConfig {
@@ -23,73 +23,98 @@ export interface TargetConfig {
   threadId?: number;
 }
 
-export interface ForwardState {
+export interface QueueItem {
+  id: string;
+  messageId: number;
+  type: ContentType;
+  name: string;
+  date: number;
+  status: QueueItemStatus;
+  error?: string;
+}
+
+export interface UserState {
+  userId: number;
+  authorized: boolean;
   source?: SourceConfig;
-  filter?: ContentFilter;
+  contentType?: ContentType;
+  available: QueueItem[];
+  selectedIds: string[];
+  queue: QueueItem[];
   target?: TargetConfig;
-  active: boolean;
-  processedKeys: string[];
-  offset: number;
+  running: boolean;
+  progressMessage?: { chatId: number; messageId: number };
   lastError?: string;
   updatedAt: string;
 }
 
-const emptyState = (): ForwardState => ({
-  active: false,
-  processedKeys: [],
+interface PersistedState {
+  offset: number;
+  users: Record<string, UserState>;
+  updatedAt: string;
+}
+
+const emptyState = (): PersistedState => ({
   offset: 0,
+  users: {},
+  updatedAt: new Date().toISOString(),
+});
+
+const emptyUser = (userId: number): UserState => ({
+  userId,
+  authorized: false,
+  available: [],
+  selectedIds: [],
+  queue: [],
+  running: false,
   updatedAt: new Date().toISOString(),
 });
 
 export class StateStore {
   private readonly statePath: string;
-  private state: ForwardState = emptyState();
+  private state: PersistedState = emptyState();
   private writeChain: Promise<void> = Promise.resolve();
 
   constructor(dataDirectory = process.env.DATA_DIR ?? "./data") {
     this.statePath = path.join(dataDirectory, "forwarder-state.json");
   }
 
-  async load(): Promise<ForwardState> {
+  async load(): Promise<void> {
     try {
-      const raw = await readFile(this.statePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<ForwardState>;
-      this.state = {
-        ...emptyState(),
-        ...parsed,
-        processedKeys: Array.isArray(parsed.processedKeys)
-          ? parsed.processedKeys.slice(-10_000)
-          : [],
-      };
+      this.state = JSON.parse(await readFile(this.statePath, "utf8")) as PersistedState;
+      for (const user of Object.values(this.state.users)) {
+        user.running = false;
+        for (const item of user.queue) {
+          if (item.status === "processing") item.status = "pending";
+        }
+      }
     } catch (error) {
       const code =
         typeof error === "object" && error !== null && "code" in error
           ? (error as { code?: string }).code
           : undefined;
       if (code !== "ENOENT") {
-        logger.warn({ err: error }, "Could not read saved bot state; starting fresh");
+        logger.warn({ err: error }, "Could not read saved Telegram state");
       }
+      this.state = emptyState();
     }
-    return this.state;
   }
 
-  get current(): ForwardState {
-    return this.state;
+  get offset() {
+    return this.state.offset;
   }
 
-  hasProcessed(key: string): boolean {
-    return this.state.processedKeys.includes(key);
-  }
-
-  async markProcessed(key: string): Promise<void> {
-    if (!this.hasProcessed(key)) {
-      this.state.processedKeys = [...this.state.processedKeys, key].slice(-10_000);
-    }
-    await this.save();
+  getUser(userId: number): UserState {
+    const key = String(userId);
+    if (!this.state.users[key]) this.state.users[key] = emptyUser(userId);
+    return this.state.users[key];
   }
 
   async save(): Promise<void> {
     this.state.updatedAt = new Date().toISOString();
+    for (const user of Object.values(this.state.users)) {
+      user.updatedAt = this.state.updatedAt;
+    }
     const snapshot = JSON.stringify(this.state, null, 2);
     this.writeChain = this.writeChain.then(async () => {
       const directory = path.dirname(this.statePath);
@@ -101,49 +126,117 @@ export class StateStore {
     await this.writeChain;
   }
 
-  async setSource(source: SourceConfig): Promise<void> {
-    this.state.source = source;
-    this.state.target = undefined;
-    this.state.active = false;
-    this.state.lastError = undefined;
-    await this.save();
-  }
-
-  async setFilter(filter: ContentFilter): Promise<void> {
-    this.state.filter = filter;
-    this.state.target = undefined;
-    this.state.active = false;
-    this.state.lastError = undefined;
-    await this.save();
-  }
-
-  async setTarget(target: TargetConfig): Promise<void> {
-    this.state.target = target;
-    this.state.lastError = undefined;
-    await this.save();
-  }
-
-  async setActive(active: boolean): Promise<void> {
-    this.state.active = active;
-    await this.save();
-  }
-
-  async setOffset(offset: number): Promise<void> {
+  async setOffset(offset: number) {
     this.state.offset = offset;
     await this.save();
   }
 
-  async setError(errorMessage: string | undefined): Promise<void> {
-    this.state.lastError = errorMessage;
+  async setAuthorized(userId: number, authorized: boolean) {
+    this.getUser(userId).authorized = authorized;
     await this.save();
   }
 
-  async reset(): Promise<void> {
-    this.state = emptyState();
+  async setSource(userId: number, source: SourceConfig) {
+    const user = this.getUser(userId);
+    user.source = source;
+    user.contentType = undefined;
+    user.available = [];
+    user.selectedIds = [];
+    user.queue = [];
+    user.target = undefined;
+    user.lastError = undefined;
     await this.save();
   }
-}
 
-export function getMessageChat(message: TelegramMessage): TelegramChat {
-  return message.chat;
+  async setAvailable(userId: number, contentType: ContentType, available: QueueItem[]) {
+    const user = this.getUser(userId);
+    user.contentType = contentType;
+    user.available = available;
+    user.selectedIds = [];
+    user.queue = [];
+    user.target = undefined;
+    user.lastError = undefined;
+    await this.save();
+  }
+
+  async setSelection(userId: number, selectedIds: string[]) {
+    this.getUser(userId).selectedIds = selectedIds;
+    await this.save();
+  }
+
+  async createQueue(userId: number) {
+    const user = this.getUser(userId);
+    const selected = new Set(user.selectedIds);
+    user.queue = user.available
+      .filter((item) => selected.has(item.id))
+      .map((item) => ({ ...item, status: "pending", error: undefined }));
+    await this.save();
+  }
+
+  async setTarget(userId: number, target: TargetConfig) {
+    this.getUser(userId).target = target;
+    await this.save();
+  }
+
+  async setRunning(userId: number, running: boolean) {
+    this.getUser(userId).running = running;
+    await this.save();
+  }
+
+  async retryFailed(userId: number) {
+    const user = this.getUser(userId);
+    for (const item of user.queue) {
+      if (item.status === "failed") {
+        item.status = "pending";
+        item.error = undefined;
+      }
+    }
+    user.lastError = undefined;
+    await this.save();
+  }
+
+  async setProgressMessage(
+    userId: number,
+    progressMessage: { chatId: number; messageId: number } | undefined,
+  ) {
+    this.getUser(userId).progressMessage = progressMessage;
+    await this.save();
+  }
+
+  async setItemStatus(
+    userId: number,
+    itemId: string,
+    status: QueueItemStatus,
+    error?: string,
+  ) {
+    const item = this.getUser(userId).queue.find((candidate) => candidate.id === itemId);
+    if (!item) return;
+    item.status = status;
+    item.error = error;
+    await this.save();
+  }
+
+  async setError(userId: number, error: string | undefined) {
+    this.getUser(userId).lastError = error;
+    await this.save();
+  }
+
+  async cancelQueue(userId: number) {
+    const user = this.getUser(userId);
+    user.running = false;
+    user.queue = [];
+    user.selectedIds = [];
+    user.target = undefined;
+    user.progressMessage = undefined;
+    await this.save();
+  }
+
+  async reset(userId: number) {
+    const current = this.getUser(userId);
+    this.state.users[String(userId)] = {
+      ...emptyUser(userId),
+      authorized: current.authorized,
+    };
+    await this.save();
+  }
 }

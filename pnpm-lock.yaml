@@ -125,6 +125,9 @@ importers:
       '@workspace/db':
         specifier: workspace:*
         version: link:../../lib/db
+      bufferutil:
+        specifier: ^4.1.0
+        version: 4.1.0
       cookie-parser:
         specifier: ^1.4.7
         version: 1.4.7
@@ -146,6 +149,9 @@ importers:
       telegram:
         specifier: ^2.26.22
         version: 2.26.22
+      utf-8-validate:
+        specifier: ^6.0.5
+        version: 6.0.6
     devDependencies:
       '@types/cookie-parser':
         specifier: ^1.4.10
@@ -1379,6 +1385,10 @@ packages:
     resolution: {integrity: sha512-Z6czzLq4u8fPOyx7TU6X3dvUZVvoJmxSQ+IcrlmagKhilxlhZgxPK6C5Jqbkw1IDUmFTM+cz9QDnnLTwDz/2gQ==}
     engines: {node: '>=6.14.2'}
 
+  utf-8-validate@6.0.6:
+    resolution: {integrity: sha512-q3l3P9UtEEiAHcsgsqTgf9PPjctrDWoIXW3NpOHFdRDbLvu4DLIcxHangJ4RLrWkBcKjmcs/6NkerI8T/rE4LA==}
+    engines: {node: '>=6.14.2'}
+
   vary@1.1.2:
     resolution: {integrity: sha512-BNGbWLfd0eUPabhkXUVm0j8uuvREyTh5ovRa/dyow/BqAbZJyC+5fU+IzQOzmAKzYqYRAISoRhdQr3eIZ/PXqg==}
     engines: {node: '>= 0.8'}
@@ -2605,6 +2615,10 @@ snapshots:
   unpipe@1.0.0: {}
 
   utf-8-validate@5.0.10:
+    dependencies:
+      node-gyp-build: 4.8.4
+
+  utf-8-validate@6.0.6:
     dependencies:
       node-gyp-build: 4.8.4
 

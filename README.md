@@ -1,7 +1,19 @@
-# Personal Telegram Forwarding Bot
+# Personal Telegram Transfer Bot
 
-Railway-ready, single-owner Telegram Bot API service.
+Railway-ready Telegram transfer bot that uses the Bot API for commands and an
+authorized Telegram user account for reading available source history and
+sending selected content.
 
-Start with [RAILWAY_SETUP.md](./RAILWAY_SETUP.md). The service uses polling, a persistent Railway Volume, owner-only controls, content filters, `.sendhere`, forum-topic targeting, retries, checkpoints, and duplicate protection.
+## Flow
 
-This version intentionally does not use personal-account login. It can forward new messages the bot is allowed to receive and can copy a specific message URL. The Telegram Bot API cannot download a complete historical chat backlog.
+1. `/login` in the bot's private chat
+2. Send a source group/channel URL
+3. Choose Files, Photos, Videos, Voice, Messages or Other Media
+4. Select individual items or all items and create the queue
+5. Send `.sendhere` in the destination group, channel or exact forum topic
+6. Use `/status`, `/stop`, `/resume` and `/cancel`
+
+Each Telegram user has an isolated session, source, destination, queue and
+checkpoint. Completed queue items are not selected again after restarts.
+
+See [RAILWAY_SETUP.md](./RAILWAY_SETUP.md) for deployment and permissions.

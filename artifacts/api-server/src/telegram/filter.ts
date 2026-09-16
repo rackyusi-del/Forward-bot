@@ -1,59 +1,34 @@
-import type { ContentFilter } from "./state";
-import type { TelegramEntity, TelegramMessage } from "./types";
+import type { ContentType } from "./state";
 
-export function messageMatchesFilter(
-  message: TelegramMessage,
-  filter: ContentFilter,
-): boolean {
-  if (isControlMessage(message)) {
-    return false;
-  }
-
-  if (filter === "everything") {
-    return hasForwardableContent(message);
-  }
-  if (filter === "files") {
-    return Boolean(message.document || message.audio || message.voice);
-  }
-  if (filter === "photos") {
-    return Boolean(message.photo);
-  }
-  if (filter === "videos") {
-    return Boolean(message.video || message.animation || message.video_note);
-  }
-  if (filter === "messages") {
-    return Boolean(message.text);
-  }
-  return hasLink(message.text, message.entities) ||
-    hasLink(message.caption, message.caption_entities);
+export function messageContentType(message: any): ContentType | undefined {
+  if (message.photo) return "photos";
+  if (message.voice) return "voice";
+  if (message.video || message.gif || message.videoNote) return "videos";
+  if (message.document && !message.audio && !message.sticker) return "files";
+  if (!message.media && message.message?.trim()) return "messages";
+  if (message.media || message.audio || message.sticker) return "other";
+  return undefined;
 }
 
-export function isControlMessage(message: TelegramMessage): boolean {
-  const text = (message.text ?? "").trim().toLowerCase();
-  return text === ".sendhere" || text === ".stop" || text.startsWith("/");
+export function matchesContentType(message: any, type: ContentType): boolean {
+  return messageContentType(message) === type;
 }
 
-function hasForwardableContent(message: TelegramMessage): boolean {
-  return Boolean(
-    message.text ||
-      message.caption ||
-      message.document ||
-      message.photo ||
-      message.video ||
-      message.animation ||
-      message.audio ||
-      message.voice ||
-      message.video_note ||
-      message.sticker,
-  );
+export function contentLabel(type: ContentType): string {
+  return {
+    files: "Files",
+    photos: "Photos",
+    videos: "Videos",
+    voice: "Voice",
+    messages: "Messages",
+    other: "Other Media",
+  }[type];
 }
 
-function hasLink(text: string | undefined, entities: TelegramEntity[] | undefined): boolean {
-  if (!text && !entities?.length) {
-    return false;
-  }
-  if (entities?.some((entity) => entity.type === "url" || entity.type === "text_link")) {
-    return true;
-  }
-  return Boolean(text && /https?:\/\/\S+/i.test(text));
+export function itemName(message: any, type: ContentType, messageId: number): string {
+  const fileName = message.file?.name;
+  if (typeof fileName === "string" && fileName.trim()) return fileName.trim();
+  const text = typeof message.message === "string" ? message.message.trim() : "";
+  if (text) return text.replace(/\s+/g, " ").slice(0, 70);
+  return `${contentLabel(type)} #${messageId}`;
 }
