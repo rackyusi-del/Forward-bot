@@ -7,6 +7,7 @@ import {
   type SourceConfig,
 } from "./state";
 import type { TelegramMessage, TelegramUpdate } from "./types";
+import { TelegramUserClient } from "./user-client";
 import { parseTelegramSourceUrl } from "./url";
 
 const filterButtons: Array<{ text: string; value: ContentFilter }> = [
@@ -41,7 +42,12 @@ export async function startTelegramBot(): Promise<void> {
     );
   }
 
-  const bot = new ForwardingBot(new TelegramApi(token), new StateStore(), ownerId);
+  const bot = new ForwardingBot(
+    new TelegramApi(token),
+    new StateStore(),
+    new TelegramUserClient(),
+    ownerId,
+  );
   await bot.run();
 }
 
@@ -56,10 +62,16 @@ function parseOwnerId(value: string | undefined): number | undefined {
 class ForwardingBot {
   private stopping = false;
   private readonly state: StateStore;
+  private pendingLoginInput?: {
+    chatId: number;
+    resolve: (value: string) => void;
+  };
+  private migrationStarted = false;
 
   constructor(
     private readonly api: TelegramApi,
     state: StateStore,
+    private readonly userClient: TelegramUserClient,
     private readonly ownerId: number | undefined,
   ) {
     this.state = state;
@@ -113,6 +125,10 @@ class ForwardingBot {
       return;
     }
 
+    if (this.consumePendingLoginInput(message)) {
+      return;
+    }
+
     if (await this.handleControlMessage(message)) {
       return;
     }
@@ -150,6 +166,35 @@ class ForwardingBot {
     if (normalized === "/reset") {
       await this.state.reset();
       await this.api.sendMessage(message.chat.id, "Saved source, target and job state were reset.");
+      return true;
+    }
+
+    if (normalized === "/login") {
+      if (!isPrivate) {
+        await this.api.sendMessage(
+          message.chat.id,
+          "Send /login in the bot's private chat.",
+          { threadId: message.message_thread_id },
+        );
+        return true;
+      }
+      if (this.ownerId === undefined || senderId !== this.ownerId) {
+        return true;
+      }
+      void this.startPersonalLogin(message.chat.id);
+      return true;
+    }
+
+    if (normalized === "/migrate") {
+      if (!isPrivate) {
+        await this.api.sendMessage(
+          message.chat.id,
+          "Send /migrate in the bot's private chat.",
+          { threadId: message.message_thread_id },
+        );
+        return true;
+      }
+      void this.startMigration(message.chat.id);
       return true;
     }
 
@@ -213,6 +258,7 @@ class ForwardingBot {
           `Forwarding started: ${filterLabels[this.state.current.filter]}\nUse .stop here or in the bot chat to stop.`,
           { threadId: message.message_thread_id },
         );
+        void this.startMigration(this.ownerId ?? message.chat.id);
       }
       return true;
     }
@@ -227,6 +273,84 @@ class ForwardingBot {
     }
 
     return false;
+  }
+
+  private consumePendingLoginInput(message: TelegramMessage): boolean {
+    if (
+      !this.pendingLoginInput ||
+      message.chat.type !== "private" ||
+      message.chat.id !== this.pendingLoginInput.chatId ||
+      message.from?.id !== this.ownerId ||
+      !message.text?.trim()
+    ) {
+      return false;
+    }
+
+    const pending = this.pendingLoginInput;
+    this.pendingLoginInput = undefined;
+    pending.resolve(message.text.trim());
+    return true;
+  }
+
+  private waitForLoginInput(chatId: number, question: string): Promise<string> {
+    if (this.pendingLoginInput) {
+      return Promise.reject(new Error("A Telegram login prompt is already waiting for input"));
+    }
+    void this.api.sendMessage(chatId, question);
+    return new Promise((resolve) => {
+      this.pendingLoginInput = { chatId, resolve };
+    });
+  }
+
+  private async startPersonalLogin(chatId: number): Promise<void> {
+    try {
+      await this.userClient.login((question) => this.waitForLoginInput(chatId, question));
+      await this.api.sendMessage(
+        chatId,
+        "Personal Telegram account connected. Your old-group migration is ready.",
+      );
+    } catch (error) {
+      await this.api.sendMessage(
+        chatId,
+        `Personal Telegram login failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  private async startMigration(chatId: number): Promise<void> {
+    if (this.migrationStarted) {
+      return;
+    }
+    const source = this.state.current.source;
+    const target = this.state.current.target;
+    const filter = this.state.current.filter;
+    if (!source || !target || !filter) {
+      await this.api.sendMessage(
+        chatId,
+        "First send the old-group URL, select Files, then send .sendhere in the new group.",
+      );
+      return;
+    }
+
+    this.migrationStarted = true;
+    try {
+      await this.userClient.migrate(
+        source,
+        target,
+        filter,
+        async (progress) => {
+          await this.api.sendMessage(chatId, progress);
+        },
+      );
+      await this.api.sendMessage(chatId, "Old-group file migration finished.");
+    } catch (error) {
+      await this.api.sendMessage(
+        chatId,
+        `Migration stopped: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    } finally {
+      this.migrationStarted = false;
+    }
   }
 
   private async handleCallback(callback: NonNullable<TelegramUpdate["callback_query"]>): Promise<void> {
@@ -339,11 +463,12 @@ class ForwardingBot {
       "1. Send a source group/channel URL here.",
       "2. Choose Files, Photos, Videos, Messages, Links or Everything.",
       "3. Send .sendhere inside the target group or exact forum topic.",
-      "4. Use .stop to stop live forwarding.",
+      "4. Use /login to connect your personal Telegram account.",
+      "5. Use /migrate to copy old files, or .stop to stop live forwarding.",
       "",
       "Use /status to view the current job and /reset to clear saved state.",
       "",
-      "Bot API limitation: it can forward new messages received after the bot is added. It cannot read a group's old history. A URL containing one message ID can copy that specific message.",
+      "The personal account migration reads old messages that your account can access and uploads them without the original sender header.",
     ].join("\n");
   }
 
