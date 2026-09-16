@@ -17,3 +17,4 @@ ENV PORT=8080
 EXPOSE 8080
 
 CMD ["pnpm", "--filter", "@workspace/api-server", "run", "start"]
+# Railway build uses the pinned pnpm version above.
