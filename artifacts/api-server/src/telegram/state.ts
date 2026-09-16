@@ -36,6 +36,7 @@ export interface QueueItem {
 export interface UserState {
   userId: number;
   authorized: boolean;
+  transferSpeed: number;
   source?: SourceConfig;
   contentType?: ContentType;
   available: QueueItem[];
@@ -63,6 +64,7 @@ const emptyState = (): PersistedState => ({
 const emptyUser = (userId: number): UserState => ({
   userId,
   authorized: false,
+  transferSpeed: 1,
   available: [],
   selectedIds: [],
   queue: [],
@@ -83,6 +85,7 @@ export class StateStore {
     try {
       this.state = JSON.parse(await readFile(this.statePath, "utf8")) as PersistedState;
       for (const user of Object.values(this.state.users)) {
+        user.transferSpeed = normalizeTransferSpeed(user.transferSpeed);
         user.running = false;
         for (const item of user.queue) {
           if (item.status === "processing") item.status = "pending";
@@ -133,6 +136,11 @@ export class StateStore {
 
   async setAuthorized(userId: number, authorized: boolean) {
     this.getUser(userId).authorized = authorized;
+    await this.save();
+  }
+
+  async setTransferSpeed(userId: number, speed: number) {
+    this.getUser(userId).transferSpeed = normalizeTransferSpeed(speed);
     await this.save();
   }
 
@@ -239,4 +247,9 @@ export class StateStore {
     };
     await this.save();
   }
+}
+
+function normalizeTransferSpeed(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 1;
+  return Math.min(10, Math.max(0.1, Math.round(value * 10) / 10));
 }

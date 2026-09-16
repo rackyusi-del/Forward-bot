@@ -48,8 +48,10 @@ chat permissions, Telegram rate limits, or sender identity restrictions.
 3. Send a source URL such as `https://t.me/examplechannel`.
 4. Choose a content type and select specific history items or all items.
 5. Press **Create queue**.
-6. Send `.sendhere` in the destination chat or exact forum topic.
-7. Use `/status`, `/stop`, `/resume` and `/cancel` as needed.
+6. Send `/transferspeed` in the bot's private chat and choose one of the 10
+   slower or 10 faster speed buttons.
+7. Send `.sendhere` in the destination chat or exact forum topic.
+8. Use `/status`, `/stop`, `/resume` and `/cancel` as needed.
 
 The queue is persisted after every item state transition. Completed items are
 never selected again; failed items are retried only when `/resume` is used.

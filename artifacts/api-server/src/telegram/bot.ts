@@ -20,6 +20,14 @@ const contentButtons: Array<{ text: string; value: ContentType }> = [
   { text: "Other Media", value: "other" },
 ];
 
+const slowerTransferSpeeds = Array.from({ length: 10 }, (_, index) => (index + 1) / 10);
+const fasterTransferSpeeds = Array.from({ length: 10 }, (_, index) => index + 1);
+const transferSpeeds = [
+  ...slowerTransferSpeeds.map((speed) => ({ speed, icon: "🐢" })),
+  ...fasterTransferSpeeds.map((speed) => ({ speed, icon: "🚀" })),
+];
+const MAX_TRANSFER_WORKERS = 4;
+
 interface PendingInput {
   chatId: number;
   resolve: (value: string) => void;
@@ -139,6 +147,21 @@ class ForwardingBot {
 
     if (normalized === "/status") {
       await this.api.sendMessage(message.chat.id, this.statusText(this.state.getUser(userId)));
+      return true;
+    }
+
+    if (normalized === "/transferspeed") {
+      if (!isPrivate) {
+        await this.api.sendMessage(message.chat.id, "Use /transferspeed in the bot's private chat.", {
+          threadId: message.message_thread_id,
+        });
+        return true;
+      }
+      await this.api.sendMessage(
+        message.chat.id,
+        `Transfer speed: ${formatSpeed(this.state.getUser(userId).transferSpeed)}\n🐢 Slow options: 0.1x–1x\n🚀 Fast options: 1x–10x`,
+        { replyMarkup: this.transferSpeedKeyboard(this.state.getUser(userId).transferSpeed) },
+      );
       return true;
     }
 
@@ -294,6 +317,22 @@ class ForwardingBot {
       return;
     }
 
+    if (data.startsWith("speed:")) {
+      const speed = Number(data.slice("speed:".length));
+      if (!Number.isFinite(speed) || speed < 0.1 || speed > 10) {
+        await this.api.answerCallbackQuery(callback.id, "Unknown transfer speed");
+        return;
+      }
+      await this.state.setTransferSpeed(userId, speed);
+      await this.api.answerCallbackQuery(callback.id, `Transfer speed set to ${speed}x`);
+      await this.api.sendMessage(
+        chatId,
+        `Transfer speed set to ${formatSpeed(speed)}.\nThis applies to your next and running transfer.`,
+        { replyMarkup: this.transferSpeedKeyboard(speed) },
+      );
+      return;
+    }
+
     await this.api.answerCallbackQuery(callback.id);
   }
 
@@ -433,25 +472,13 @@ class ForwardingBot {
         messageId: progress.message_id,
       });
 
-      while (this.state.getUser(userId).running) {
-        const user = this.state.getUser(userId);
-        const item = user.queue.find((candidate) => candidate.status === "pending");
-        if (!item) break;
-
-        await this.state.setItemStatus(userId, item.id, "processing");
-        await this.updateProgress(userId, item);
-        try {
-          const current = this.state.getUser(userId);
-          await this.userClient.sendItem(userId, current.source!, current.target!, item);
-          await this.state.setItemStatus(userId, item.id, "completed");
-        } catch (error) {
-          await this.state.setItemStatus(userId, item.id, "failed", safeError(error));
-          await this.state.setError(userId, safeError(error));
-          logger.warn({ userId, itemId: item.id, err: error }, "Transfer item failed");
-        }
-        await this.updateProgress(userId);
-        await pause(350);
-      }
+      const speed = this.state.getUser(userId).transferSpeed;
+      const workerCount = this.transferWorkerCount(speed);
+      await Promise.all(
+        Array.from({ length: workerCount }, () =>
+          this.processTransferQueue(userId, speed),
+        ),
+      );
 
       const finalUser = this.state.getUser(userId);
       if (finalUser.running) {
@@ -474,6 +501,36 @@ class ForwardingBot {
     } finally {
       this.transferLoops.delete(userId);
     }
+  }
+
+  private async processTransferQueue(userId: number, speed: number): Promise<void> {
+    while (this.state.getUser(userId).running) {
+      const user = this.state.getUser(userId);
+      const item = user.queue.find((candidate) => candidate.status === "pending");
+      if (!item) return;
+
+      await this.state.setItemStatus(userId, item.id, "processing");
+      await this.updateProgress(userId, item);
+      try {
+        const current = this.state.getUser(userId);
+        await this.userClient.sendItem(userId, current.source!, current.target!, item);
+        await this.state.setItemStatus(userId, item.id, "completed");
+      } catch (error) {
+        await this.state.setItemStatus(userId, item.id, "failed", safeError(error));
+        await this.state.setError(userId, safeError(error));
+        logger.warn({ userId, itemId: item.id, err: error }, "Transfer item failed");
+      }
+      await this.updateProgress(userId);
+      await pause(this.transferDelay(speed));
+    }
+  }
+
+  private transferWorkerCount(speed: number): number {
+    return Math.min(MAX_TRANSFER_WORKERS, Math.max(1, Math.ceil(speed / 3)));
+  }
+
+  private transferDelay(speed: number): number {
+    return Math.max(0, Math.round(350 / speed));
   }
 
   private async updateProgress(userId: number, currentItem?: QueueItem): Promise<void> {
@@ -499,6 +556,7 @@ class ForwardingBot {
     const bar = `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
     return [
       "Sending queue...",
+      `Speed: ${user.transferSpeed}x`,
       `[${bar}] ${completed}/${total}`,
       currentItem ? `Sending: ${currentItem.name}` : "Preparing next item...",
     ].join("\n");
@@ -530,6 +588,19 @@ class ForwardingBot {
         })),
       ],
     };
+  }
+
+  private transferSpeedKeyboard(selectedSpeed: number) {
+    const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+    for (let index = 0; index < transferSpeeds.length; index += 5) {
+      rows.push(
+        transferSpeeds.slice(index, index + 5).map((speed) => ({
+          text: `${speed.speed === selectedSpeed ? "✓ " : ""}${speed.icon} ${formatSpeed(speed.speed)}`,
+          callback_data: `speed:${speed.speed}`,
+        })),
+      );
+    }
+    return { inline_keyboard: rows };
   }
 
   private selectionKeyboard(
@@ -572,7 +643,8 @@ class ForwardingBot {
       "3. Choose Files, Photos, Videos, Voice, Messages or Other Media.",
       "4. Select individual items or Select all, then Create queue.",
       "5. Send .sendhere inside the exact destination group, channel or forum topic.",
-      "6. Watch the live queue progress. Use /stop, /resume, /cancel or /status.",
+       "6. Use /transferspeed to choose one of 10 slow or 10 fast speeds.",
+       "7. Use /stop, /resume, /cancel or /status as needed.",
       "",
       "Every Telegram user has a separate session, source, destination and checkpoint.",
       "Only chats your authorized Telegram account can access are supported.",
@@ -591,6 +663,7 @@ class ForwardingBot {
       `Destination: ${user.target?.title ?? (user.target ? String(user.target.chatId) : "not set")}`,
       `Forum topic: ${user.target?.threadId ?? "none"}`,
       `Queue status: ${user.running ? "running" : "paused"}`,
+      `Transfer speed: ${formatSpeed(user.transferSpeed)}`,
       `Total: ${user.queue.length}`,
       `Completed: ${completed}`,
       `Pending: ${pending}`,
@@ -611,6 +684,10 @@ class ForwardingBot {
 function safeError(error: unknown): string {
   if (error instanceof Error) return error.message.slice(0, 240);
   return "Unknown Telegram error";
+}
+
+function formatSpeed(speed: number): string {
+  return `${Number.isInteger(speed) ? speed : speed.toFixed(1)}x`;
 }
 
 function pause(milliseconds: number) {
