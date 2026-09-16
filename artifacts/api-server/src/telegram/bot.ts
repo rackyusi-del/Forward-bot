@@ -96,6 +96,7 @@ class ForwardingBot {
       ])
       .catch((error) => logger.warn({ err: error }, "Could not register Telegram commands"));
     await this.api.deleteWebhook();
+    await this.restoreSchedules();
     logger.info(
       { username: bot.username ?? bot.first_name },
       "Telegram polling started",
@@ -494,6 +495,28 @@ class ForwardingBot {
       void this.startTransfer(userId, chatId, threadId);
     }, delay);
     this.scheduleTimers.set(userId, timer);
+  }
+
+  private async restoreSchedules(): Promise<void> {
+    for (const user of this.state.listUsers()) {
+      if (!user.scheduledAt || !user.target || !user.queue.length) continue;
+      const scheduledAt = Date.parse(user.scheduledAt);
+      if (!Number.isFinite(scheduledAt)) {
+        await this.state.setScheduledAt(user.userId, undefined);
+        continue;
+      }
+      if (scheduledAt <= Date.now()) {
+        await this.state.setScheduledAt(user.userId, undefined);
+        void this.startTransfer(user.userId, user.target.chatId, user.target.threadId);
+        continue;
+      }
+      await this.scheduleTransfer(
+        user.userId,
+        user.target.chatId,
+        user.target.threadId,
+        scheduledAt,
+      );
+    }
   }
 
   private async clearSchedule(userId: number): Promise<void> {

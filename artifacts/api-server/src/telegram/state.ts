@@ -142,6 +142,10 @@ export class StateStore {
     return this.state.users[key];
   }
 
+  listUsers(): UserState[] {
+    return Object.values(this.state.users);
+  }
+
   async save(): Promise<void> {
     this.state.updatedAt = new Date().toISOString();
     for (const user of Object.values(this.state.users)) {
