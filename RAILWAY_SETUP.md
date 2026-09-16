@@ -54,7 +54,8 @@ chat permissions, Telegram rate limits, or sender identity restrictions.
 8. Use `/queue`, `/status`, `/history`, `/stats` and `/logs` to monitor the job.
 9. Use `/filter`, `/maxsize`, `/duplicates`, `/retry` and `/skip` to control it.
 10. Use `/schedule`, `/notify`, `/destination`, `/settings` and `/language`.
-11. Use `/stop`, `/resume`, `/cancel`, `/reset` and `/logout` as needed.
+11. Use `/stop` to pause, `/on` to continue from the saved queue, `/cancel`,
+    `/reset` and `/logout` as needed.
 
 The queue is persisted after every item state transition. Completed items are
 never selected again; failed items are retried only when `/resume` is used.

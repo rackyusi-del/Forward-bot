@@ -82,6 +82,7 @@ class ForwardingBot {
         { command: "retry", description: "Retry failed items" },
         { command: "skip", description: "Skip next pending item" },
         { command: "stop", description: "Pause transfer" },
+         { command: "on", description: "Resume transfer" },
         { command: "resume", description: "Resume transfer" },
         { command: "cancel", description: "Cancel current queue" },
         { command: "filter", description: "Filter source items" },
@@ -390,18 +391,39 @@ class ForwardingBot {
     }
 
     if (normalized === "/stop") {
-      await this.state.setRunning(userId, false);
-      await this.api.sendMessage(message.chat.id, translate(user.language, "transferPaused"));
+      const saveStopState = this.state.setRunning(userId, false);
+      await this.api.sendMessage(
+        message.chat.id,
+        "Transfer stopped. The active item was kept in the queue. Send /on to continue from here.",
+        { threadId: message.message_thread_id },
+      );
+      await Promise.allSettled([
+        saveStopState,
+        this.userClient.stopTransfer(userId),
+      ]);
       return true;
     }
 
-    if (normalized === "/resume") {
+    if (normalized === "/resume" || normalized === "/on") {
       if (!isPrivate) {
-        await this.api.sendMessage(message.chat.id, "Use /resume in the bot's private chat.");
+        await this.api.sendMessage(message.chat.id, "Use /on in the bot's private chat.");
+        return true;
+      }
+      if (this.state.getUser(userId).running) {
+        await this.api.sendMessage(message.chat.id, "Transfer is already running.");
+        return true;
+      }
+      await this.waitForTransferToStop(userId);
+      if (this.transferLoops.has(userId)) {
+        await this.api.sendMessage(
+          message.chat.id,
+          "The previous transfer is still stopping. Please send /resume again in a few seconds.",
+        );
         return true;
       }
       await this.state.retryFailed(userId);
       void this.startTransfer(userId, message.chat.id);
+      await this.api.sendMessage(message.chat.id, "Transfer is on. Continuing from the saved queue.");
       return true;
     }
 
@@ -524,6 +546,12 @@ class ForwardingBot {
     if (timer) clearTimeout(timer);
     this.scheduleTimers.delete(userId);
     await this.state.setScheduledAt(userId, undefined);
+  }
+
+  private async waitForTransferToStop(userId: number): Promise<void> {
+    for (let attempt = 0; attempt < 100 && this.transferLoops.has(userId); attempt += 1) {
+      await pause(100);
+    }
   }
 
   private consumePendingInput(message: TelegramMessage): boolean {
@@ -832,9 +860,17 @@ class ForwardingBot {
         await this.state.setItemStatus(userId, item.id, "completed");
         await this.state.markItemSent(userId, item);
       } catch (error) {
-        await this.state.setItemStatus(userId, item.id, "failed", safeError(error));
-        await this.state.setError(userId, safeError(error));
-        logger.warn({ userId, itemId: item.id, err: error }, "Transfer item failed");
+        const stopped = !this.state.getUser(userId).running;
+        await this.state.setItemStatus(
+          userId,
+          item.id,
+          stopped ? "pending" : "failed",
+          stopped ? undefined : safeError(error),
+        );
+        if (!stopped) {
+          await this.state.setError(userId, safeError(error));
+          logger.warn({ userId, itemId: item.id, err: error }, "Transfer item failed");
+        }
       }
       await this.updateProgress(userId);
       await pause(this.transferDelay(speed));
@@ -1012,7 +1048,7 @@ class ForwardingBot {
       "5. Send .sendhere inside the exact destination group, channel or forum topic.",
        "6. Use /transferspeed to choose one of 10 slow or 10 fast speeds.",
       "7. Use /queue, /history, /stats, /settings and /logs.",
-      "8. Use /stop, /resume, /cancel or /status as needed.",
+      "8. Use /stop to pause and /on to continue, or /cancel to clear the queue.",
       "",
       "Every Telegram user has a separate session, source, destination and checkpoint.",
       "Only chats your authorized Telegram account can access are supported.",

@@ -86,6 +86,16 @@ export class TelegramUserClient {
     await unlink(this.sessionPath(userId)).catch(() => undefined);
   }
 
+  async stopTransfer(userId: number): Promise<void> {
+    const client = this.clients.get(userId);
+    if (!client) return;
+
+    this.clients.delete(userId);
+    await client.disconnect().catch((error) => {
+      logger.debug({ userId, err: error }, "Telegram transfer client was already disconnected");
+    });
+  }
+
   async discover(
     userId: number,
     source: SourceConfig,
