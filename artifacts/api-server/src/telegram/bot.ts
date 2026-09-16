@@ -39,6 +39,10 @@ interface PendingInput {
   resolve: (value: string) => void;
 }
 
+interface TransferRun {
+  cancelled: boolean;
+}
+
 export async function startTelegramBot(): Promise<void> {
   const token = process.env.BOT_TOKEN?.trim();
   if (!token) {
@@ -57,7 +61,7 @@ export async function startTelegramBot(): Promise<void> {
 class ForwardingBot {
   private stopping = false;
   private readonly pendingInputs = new Map<number, PendingInput>();
-  private readonly transferLoops = new Set<number>();
+  private readonly transferRuns = new Map<number, TransferRun>();
   private readonly scheduleTimers = new Map<number, NodeJS.Timeout>();
 
   constructor(
@@ -389,16 +393,16 @@ class ForwardingBot {
     }
 
     if (normalized === "/stop") {
+      const transferRun = this.transferRuns.get(userId);
+      if (transferRun) transferRun.cancelled = true;
       const saveStopState = this.state.setRunning(userId, false);
       await this.api.sendMessage(
         message.chat.id,
         "Transfer stopped. The active item was kept in the queue. Send /on to continue from here.",
         { threadId: message.message_thread_id },
       );
-      await Promise.allSettled([
-        saveStopState,
-        this.userClient.stopTransfer(userId),
-      ]);
+      this.userClient.stopTransfer(userId);
+      await saveStopState;
       return true;
     }
 
@@ -409,14 +413,6 @@ class ForwardingBot {
       }
       if (this.state.getUser(userId).running) {
         await this.api.sendMessage(message.chat.id, "Transfer is already running.");
-        return true;
-      }
-      await this.waitForTransferToStop(userId);
-      if (this.transferLoops.has(userId)) {
-        await this.api.sendMessage(
-          message.chat.id,
-          "The previous transfer is still stopping. Please send /resume again in a few seconds.",
-        );
         return true;
       }
       await this.state.retryFailed(userId);
@@ -544,12 +540,6 @@ class ForwardingBot {
     if (timer) clearTimeout(timer);
     this.scheduleTimers.delete(userId);
     await this.state.setScheduledAt(userId, undefined);
-  }
-
-  private async waitForTransferToStop(userId: number): Promise<void> {
-    for (let attempt = 0; attempt < 100 && this.transferLoops.has(userId); attempt += 1) {
-      await pause(100);
-    }
   }
 
   private consumePendingInput(message: TelegramMessage): boolean {
@@ -774,7 +764,8 @@ class ForwardingBot {
     notifyChatId: number,
     notifyThreadId?: number,
   ): Promise<void> {
-    if (this.transferLoops.has(userId)) return;
+    const existingRun = this.transferRuns.get(userId);
+    if (existingRun && !existingRun.cancelled) return;
     const initial = this.state.getUser(userId);
     if (!initial.authorized || !initial.source || !initial.target || !initial.queue.length) {
       await this.api.sendMessage(
@@ -785,7 +776,8 @@ class ForwardingBot {
       return;
     }
 
-    this.transferLoops.add(userId);
+    const transferRun: TransferRun = { cancelled: false };
+    this.transferRuns.set(userId, transferRun);
     await this.state.setRunning(userId, true);
     const shouldRecordHistory = initial.queue.some((item) => item.status !== "completed");
     try {
@@ -803,12 +795,12 @@ class ForwardingBot {
       const workerCount = this.transferWorkerCount(speed);
       await Promise.all(
         Array.from({ length: workerCount }, () =>
-          this.processTransferQueue(userId, speed),
+          this.processTransferQueue(userId, speed, transferRun),
         ),
       );
 
       const finalUser = this.state.getUser(userId);
-      if (finalUser.running) {
+      if (!transferRun.cancelled && finalUser.running) {
         await this.state.setRunning(userId, false);
         await this.updateProgress(userId);
         if (shouldRecordHistory) {
@@ -828,24 +820,32 @@ class ForwardingBot {
             threadId: notifyThreadId,
           });
         }
-      } else {
+      } else if (!transferRun.cancelled) {
         await this.api.sendMessage(notifyChatId, "Transfer paused. Completed items are saved; use /resume to continue.", {
           threadId: notifyThreadId,
         });
       }
     } catch (error) {
-      await this.state.setRunning(userId, false);
-      await this.state.setError(userId, safeError(error));
-      await this.api.sendMessage(notifyChatId, `Transfer stopped safely: ${safeError(error)}`, {
-        threadId: notifyThreadId,
-      });
+      if (!transferRun.cancelled) {
+        await this.state.setRunning(userId, false);
+        await this.state.setError(userId, safeError(error));
+        await this.api.sendMessage(notifyChatId, `Transfer stopped safely: ${safeError(error)}`, {
+          threadId: notifyThreadId,
+        });
+      }
     } finally {
-      this.transferLoops.delete(userId);
+      if (this.transferRuns.get(userId) === transferRun) {
+        this.transferRuns.delete(userId);
+      }
     }
   }
 
-  private async processTransferQueue(userId: number, speed: number): Promise<void> {
-    while (this.state.getUser(userId).running) {
+  private async processTransferQueue(
+    userId: number,
+    speed: number,
+    transferRun: TransferRun,
+  ): Promise<void> {
+    while (!transferRun.cancelled && this.state.getUser(userId).running) {
       const user = this.state.getUser(userId);
       const item = user.queue.find((candidate) => candidate.status === "pending");
       if (!item) return;
@@ -854,11 +854,21 @@ class ForwardingBot {
       await this.updateProgress(userId, item);
       try {
         const current = this.state.getUser(userId);
-        await this.userClient.sendItem(userId, current.source!, current.target!, item);
+        await this.userClient.sendItem(
+          userId,
+          current.source!,
+          current.target!,
+          item,
+          () => transferRun.cancelled,
+        );
+        if (transferRun.cancelled) {
+          await this.state.setItemStatus(userId, item.id, "pending");
+          return;
+        }
         await this.state.setItemStatus(userId, item.id, "completed");
         await this.state.markItemSent(userId, item);
       } catch (error) {
-        const stopped = !this.state.getUser(userId).running;
+        const stopped = transferRun.cancelled || !this.state.getUser(userId).running;
         await this.state.setItemStatus(
           userId,
           item.id,
@@ -870,6 +880,7 @@ class ForwardingBot {
           logger.warn({ userId, itemId: item.id, err: error }, "Transfer item failed");
         }
       }
+      if (transferRun.cancelled) return;
       await this.updateProgress(userId);
       await pause(this.transferDelay(speed));
     }

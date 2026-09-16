@@ -13,6 +13,7 @@ import { itemName, matchesContentType, messageContentType } from "./filter";
 
 type Prompt = (question: string) => Promise<string>;
 type Progress = (completed: number, total: number, name: string) => Promise<void>;
+type IsCancelled = () => boolean;
 
 export interface DiscoveryResult {
   items: QueueItem[];
@@ -86,12 +87,12 @@ export class TelegramUserClient {
     await unlink(this.sessionPath(userId)).catch(() => undefined);
   }
 
-  async stopTransfer(userId: number): Promise<void> {
+  stopTransfer(userId: number): void {
     const client = this.clients.get(userId);
     if (!client) return;
 
     this.clients.delete(userId);
-    await client.disconnect().catch((error) => {
+    void client.disconnect().catch((error) => {
       logger.debug({ userId, err: error }, "Telegram transfer client was already disconnected");
     });
   }
@@ -149,7 +150,9 @@ export class TelegramUserClient {
     source: SourceConfig,
     target: TargetConfig,
     item: QueueItem,
+    isCancelled: IsCancelled = () => false,
   ): Promise<void> {
+    if (isCancelled()) throw new Error("Transfer was stopped");
     const client = await this.getClient(userId);
     const sourceEntity = await client.getInputEntity(source.chatId);
     const targetEntity = await client.getInputEntity(target.chatId);
@@ -174,8 +177,10 @@ export class TelegramUserClient {
         } else {
           throw new Error("Source media is unavailable");
         }
+        if (isCancelled()) throw new Error("Transfer was stopped");
         return;
       } catch (error) {
+        if (isCancelled()) throw error;
         const seconds = floodWaitSeconds(error);
         if (seconds === undefined || attempt >= 3) throw error;
         await pause(Math.max(1, seconds) * 1_000);
