@@ -114,13 +114,10 @@ class ForwardingBot {
       try {
         const updates = await this.api.getUpdates(this.state.offset + 1);
         for (const update of updates) {
-          try {
-            await this.handleUpdate(update);
-          } catch (error) {
+          void this.handleUpdate(update).catch((error) => {
             logger.warn({ err: error, updateId: update.update_id }, "Telegram update failed");
-          } finally {
-            await this.state.setOffset(update.update_id);
-          }
+          });
+          await this.state.setOffset(update.update_id);
         }
       } catch (error) {
         if (error instanceof TelegramApiError && error.errorCode === 409) {
@@ -158,7 +155,8 @@ class ForwardingBot {
     const text = message.text?.trim() ?? "";
     const normalized = text.toLowerCase();
     const isPrivate = message.chat.type === "private";
-    const [command, ...args] = normalized.split(/\s+/);
+    const [rawCommand, ...args] = normalized.split(/\s+/);
+    const command = rawCommand.split("@", 1)[0];
     const user = this.state.getUser(userId);
 
     if (command === "/language") {
