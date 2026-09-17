@@ -489,6 +489,19 @@ class ForwardingBot {
         await this.api.sendMessage(message.chat.id, "Use /on in the bot's private chat.");
         return true;
       }
+      const existingRun = this.transferRuns.get(userId);
+      const hasProcessingItem = user.queue.some((item) => item.status === "processing");
+      if (
+        existingRun &&
+        !existingRun.cancelled &&
+        (existingRun.operationInFlight || hasProcessingItem)
+      ) {
+        await this.api.sendMessage(
+          message.chat.id,
+          "Transfer is already running. Do not send /on again; use /status to check progress.",
+        );
+        return true;
+      }
       await this.stopExistingTransfer(userId);
       await this.state.retryFailed(userId);
       void this.startTransfer(userId, message.chat.id);
