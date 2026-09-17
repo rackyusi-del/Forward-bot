@@ -16,7 +16,9 @@ sending selected content.
 7. Use `/queue`, `/status`, `/history`, `/stats` and `/logs` to monitor work
 8. Use `/filter`, `/maxsize`, `/duplicates`, `/retry` and `/skip` to control work
 9. Use `/schedule`, `/notify`, `/destination`, `/settings` and `/language`
-10. Use `/stop` to pause, `/on` to continue from the saved queue, `/cancel`,
+10. Use `/live on` or `/live off` to control automatic monitoring for new
+    matching files in the source
+11. Use `/stop` to pause, `/on` to continue from the saved queue, `/cancel`,
     `/reset` and `/logout` as needed
 
 Each Telegram user has an isolated session, source, destination, queue and

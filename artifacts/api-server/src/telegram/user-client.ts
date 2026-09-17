@@ -19,6 +19,7 @@ const DEFAULT_TRANSFER_ITEM_TIMEOUT_MS = 120_000;
 export interface DiscoveryResult {
   items: QueueItem[];
   truncated: boolean;
+  latestMessageId?: number;
 }
 
 export class TelegramUserClient {
@@ -99,17 +100,27 @@ export class TelegramUserClient {
     userId: number,
     source: SourceConfig,
     type: ContentType,
-    options: { filterText?: string; maxFileSizeMb?: number } = {},
+    options: {
+      filterText?: string;
+      maxFileSizeMb?: number;
+      minMessageId?: number;
+    } = {},
   ): Promise<DiscoveryResult> {
     const client = await this.getClient(userId);
     const sourceEntity = await client.getInputEntity(source.chatId);
     const items: QueueItem[] = [];
     const seen = new Set<number>();
     const maxItems = Number(process.env.MAX_DISCOVERY_ITEMS ?? "25000");
+    let latestMessageId = options.minMessageId ?? 0;
 
-    for await (const message of client.iterMessages(sourceEntity, { reverse: true })) {
+    for await (const message of client.iterMessages(sourceEntity, {
+      reverse: true,
+      minId: options.minMessageId,
+    })) {
       const messageId = Number(message.id);
-      if (!Number.isSafeInteger(messageId) || seen.has(messageId)) continue;
+      if (!Number.isSafeInteger(messageId)) continue;
+      latestMessageId = Math.max(latestMessageId, messageId);
+      if (seen.has(messageId)) continue;
       if (!matchesContentType(message, type)) continue;
       const name = itemName(message, type, messageId);
       const fileSize = Number(message.file?.size ?? 0);
@@ -136,11 +147,11 @@ export class TelegramUserClient {
         status: "pending",
       });
       if (items.length >= maxItems) {
-        return { items, truncated: true };
+        return { items, truncated: true, latestMessageId };
       }
     }
 
-    return { items, truncated: false };
+    return { items, truncated: false, latestMessageId };
   }
 
   async sendItem(
@@ -320,5 +331,9 @@ function pause(milliseconds: number) {
 }
 
 function uploadWorkerCount(speed: number): number {
-  return Math.min(16, Math.max(1, Math.ceil(speed)));
+  const configured = Number(process.env.MAX_UPLOAD_WORKERS ?? "4");
+  const maximum = Number.isFinite(configured)
+    ? Math.min(4, Math.max(1, Math.round(configured)))
+    : 4;
+  return Math.min(maximum, Math.max(1, Math.ceil(speed)));
 }

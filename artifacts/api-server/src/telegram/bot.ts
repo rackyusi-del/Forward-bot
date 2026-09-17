@@ -32,7 +32,13 @@ const transferSpeeds = [
   ...slowerTransferSpeeds.map((speed) => ({ speed, icon: "🐢" })),
   ...fasterTransferSpeeds.map((speed) => ({ speed, icon: "🐇" })),
 ];
-const MAX_TRANSFER_WORKERS = 8;
+const MAX_TRANSFER_WORKERS = boundedEnvNumber("MAX_TRANSFER_WORKERS", 2, 1, 3);
+const LIVE_POLL_INTERVAL_MS = boundedEnvNumber(
+  "LIVE_POLL_INTERVAL_MS",
+  15_000,
+  5_000,
+  120_000,
+);
 
 interface PendingInput {
   chatId: number;
@@ -96,6 +102,7 @@ class ForwardingBot {
         { command: "notify", description: "Toggle completion notifications" },
         { command: "destination", description: "Show current destination" },
         { command: "language", description: "Choose language" },
+        { command: "live", description: "Toggle live source monitoring" },
         { command: "settings", description: "Show settings" },
         { command: "privacy", description: "Show privacy information" },
         { command: "ping", description: "Check bot status" },
@@ -179,10 +186,27 @@ class ForwardingBot {
       await this.api.sendMessage(message.chat.id, translate(user.language, "settings", {
         language: languageLabel(user.language),
         speed: formatSpeed(user.transferSpeed),
+        live: user.liveMode ? "on" : "off",
         notify: user.notifyOnComplete ? "on" : "off",
         maxSize: user.maxFileSizeMb ? `${user.maxFileSizeMb} MB` : "unlimited",
         filter: user.filterText ?? "none",
       }));
+      return true;
+    }
+
+    if (command === "/live") {
+      const value = args[0];
+      if (value !== "on" && value !== "off") {
+        await this.api.sendMessage(message.chat.id, "Usage: /live on or /live off");
+      } else {
+        await this.state.setLiveMode(userId, value === "on");
+        await this.api.sendMessage(
+          message.chat.id,
+          value === "on"
+            ? "Live source monitoring is on. New matching files will be queued automatically."
+            : "Live source monitoring is off. The current queue will finish normally.",
+        );
+      }
       return true;
     }
 
@@ -662,7 +686,7 @@ class ForwardingBot {
         filterText: user.filterText,
         maxFileSizeMb: user.maxFileSizeMb,
       });
-      await this.state.setAvailable(userId, type, result.items);
+      await this.state.setAvailable(userId, type, result.items, result.latestMessageId);
       if (!result.items.length) {
         await this.api.sendMessage(chatId, `No ${contentLabel(type).toLowerCase()} were found in ${source.label}.`);
         return;
@@ -791,11 +815,13 @@ class ForwardingBot {
         messageId: progress.message_id,
       });
 
-      await Promise.all(
-        Array.from({ length: MAX_TRANSFER_WORKERS }, (_, workerIndex) =>
-          this.processTransferQueue(userId, transferRun, workerIndex),
-        ),
+      const workers = Array.from({ length: MAX_TRANSFER_WORKERS }, (_, workerIndex) =>
+        this.processTransferQueue(userId, transferRun, workerIndex),
       );
+      await Promise.all([
+        ...workers,
+        this.watchLiveSource(userId, transferRun, notifyChatId, notifyThreadId),
+      ]);
 
       const finalUser = this.state.getUser(userId);
       if (!transferRun.cancelled && finalUser.running) {
@@ -851,7 +877,11 @@ class ForwardingBot {
         continue;
       }
       const item = user.queue.find((candidate) => candidate.status === "pending");
-      if (!item) return;
+      if (!item) {
+        if (!user.liveMode) return;
+        await pause(1_000);
+        continue;
+      }
 
       await this.state.setItemStatus(userId, item.id, "processing");
       await this.updateProgress(userId, item);
@@ -893,6 +923,52 @@ class ForwardingBot {
 
   private isCurrentTransferRun(userId: number, transferRun: TransferRun): boolean {
     return this.transferRuns.get(userId) === transferRun;
+  }
+
+  private async watchLiveSource(
+    userId: number,
+    transferRun: TransferRun,
+    notifyChatId: number,
+    notifyThreadId?: number,
+  ): Promise<void> {
+    while (!transferRun.cancelled && this.state.getUser(userId).running) {
+      await pause(LIVE_POLL_INTERVAL_MS);
+      if (transferRun.cancelled || !this.state.getUser(userId).running) return;
+
+      const user = this.state.getUser(userId);
+      if (!user.liveMode) {
+        const hasWork = user.queue.some(
+          (item) => item.status === "pending" || item.status === "processing",
+        );
+        if (!hasWork) return;
+        continue;
+      }
+      if (!user.source || !user.contentType) continue;
+
+      try {
+        const result = await this.userClient.discover(userId, user.source, user.contentType, {
+          filterText: user.filterText,
+          maxFileSizeMb: user.maxFileSizeMb,
+          minMessageId: user.lastSeenMessageId,
+        });
+        const added = await this.state.appendLiveItems(
+          userId,
+          result.items,
+          result.latestMessageId,
+        );
+        if (added > 0) {
+          const current = this.state.getUser(userId);
+          await this.api.sendMessage(
+            notifyChatId,
+            `Live update: ${added} new ${contentLabel(user.contentType).toLowerCase()} added.\nQueue: ${current.queue.length} items.`,
+            { threadId: notifyThreadId },
+          );
+        }
+      } catch (error) {
+        await this.state.setError(userId, safeError(error));
+        logger.warn({ userId, err: error }, "Live source poll failed; transfer will continue");
+      }
+    }
   }
 
   private transferWorkerCount(speed: number): number {
@@ -1066,7 +1142,8 @@ class ForwardingBot {
       "5. Send .sendhere inside the exact destination group, channel or forum topic.",
        "6. Use /transferspeed to choose one of 10 slow or 10 fast speeds.",
       "7. Use /queue, /history, /stats, /settings and /logs.",
-      "8. Use /stop to pause and /on to continue, or /cancel to clear the queue.",
+      "8. Use /live on or /live off to control automatic new-file monitoring.",
+      "9. Use /stop to pause and /on to continue, or /cancel to clear the queue.",
       "",
       "Every Telegram user has a separate session, source, destination and checkpoint.",
       "Only chats your authorized Telegram account can access are supported.",
@@ -1080,6 +1157,7 @@ class ForwardingBot {
     const processing = user.queue.find((item) => item.status === "processing");
     return [
       `Account: ${user.authorized ? "verified" : "not verified"}`,
+      `Live monitoring: ${user.liveMode ? "on" : "off"}`,
       `Source: ${user.source?.label ?? "not set"}`,
       `Content: ${user.contentType ? contentLabel(user.contentType) : "not selected"}`,
       `Destination: ${user.target?.title ?? (user.target ? String(user.target.chatId) : "not set")}`,
@@ -1110,6 +1188,18 @@ function safeError(error: unknown): string {
 
 function formatSpeed(speed: number): string {
   return `${Number.isInteger(speed) ? speed : speed.toFixed(1)}x`;
+}
+
+function boundedEnvNumber(
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const value = Number(process.env[name] ?? fallback);
+  return Number.isFinite(value)
+    ? Math.min(maximum, Math.max(minimum, Math.round(value)))
+    : fallback;
 }
 
 function pause(milliseconds: number) {

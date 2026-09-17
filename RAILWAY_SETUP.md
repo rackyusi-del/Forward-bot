@@ -13,6 +13,9 @@ API_ID=your_my_telegram_org_api_id
 API_HASH=your_my_telegram_org_api_hash
 DATA_DIR=/data
 TRANSFER_ITEM_TIMEOUT_MS=120000
+MAX_TRANSFER_WORKERS=2
+MAX_UPLOAD_WORKERS=4
+LIVE_POLL_INTERVAL_MS=15000
 NODE_ENV=production
 LOG_LEVEL=info
 ```
@@ -57,6 +60,9 @@ chat permissions, Telegram rate limits, or sender identity restrictions.
 10. Use `/schedule`, `/notify`, `/destination`, `/settings` and `/language`.
 11. Use `/stop` to pause, `/on` to continue from the saved queue, `/cancel`,
     `/reset` and `/logout` as needed.
+12. Live source monitoring is enabled by default. Use `/live off` to finish the
+    current queue without adding newly arriving matching files, or `/live on` to
+    enable it again.
 
 The queue is persisted after every item state transition. Completed items are
 never selected again; failed items are retried only when `/resume` is used.

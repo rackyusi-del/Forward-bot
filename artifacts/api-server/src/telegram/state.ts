@@ -47,6 +47,7 @@ export interface TransferHistory {
 export interface UserState {
   userId: number;
   authorized: boolean;
+  liveMode: boolean;
   transferSpeed: number;
   language: LanguageCode;
   notifyOnComplete: boolean;
@@ -57,6 +58,7 @@ export interface UserState {
   sentItemKeys: string[];
   history: TransferHistory[];
   source?: SourceConfig;
+  lastSeenMessageId?: number;
   contentType?: ContentType;
   available: QueueItem[];
   selectedIds: string[];
@@ -83,6 +85,7 @@ const emptyState = (): PersistedState => ({
 const emptyUser = (userId: number): UserState => ({
   userId,
   authorized: false,
+  liveMode: true,
   transferSpeed: 1,
   language: "en",
   notifyOnComplete: true,
@@ -110,6 +113,7 @@ export class StateStore {
       this.state = JSON.parse(await readFile(this.statePath, "utf8")) as PersistedState;
       for (const user of Object.values(this.state.users)) {
         user.transferSpeed = normalizeTransferSpeed(user.transferSpeed);
+        user.liveMode ??= true;
         user.language ??= "en";
         user.notifyOnComplete ??= true;
         user.duplicateCount ??= 0;
@@ -172,6 +176,11 @@ export class StateStore {
     await this.save();
   }
 
+  async setLiveMode(userId: number, enabled: boolean) {
+    this.getUser(userId).liveMode = enabled;
+    await this.save();
+  }
+
   async setTransferSpeed(userId: number, speed: number) {
     this.getUser(userId).transferSpeed = normalizeTransferSpeed(speed);
     await this.save();
@@ -206,6 +215,7 @@ export class StateStore {
   async setSource(userId: number, source: SourceConfig) {
     const user = this.getUser(userId);
     user.source = source;
+    user.lastSeenMessageId = undefined;
     user.contentType = undefined;
     user.available = [];
     user.selectedIds = [];
@@ -215,15 +225,61 @@ export class StateStore {
     await this.save();
   }
 
-  async setAvailable(userId: number, contentType: ContentType, available: QueueItem[]) {
+  async setAvailable(
+    userId: number,
+    contentType: ContentType,
+    available: QueueItem[],
+    lastSeenMessageId?: number,
+  ) {
     const user = this.getUser(userId);
     user.contentType = contentType;
     user.available = available;
+    user.lastSeenMessageId = lastSeenMessageId;
     user.selectedIds = [];
     user.queue = [];
     user.target = undefined;
     user.lastError = undefined;
     await this.save();
+  }
+
+  async appendLiveItems(
+    userId: number,
+    items: QueueItem[],
+    lastSeenMessageId?: number,
+  ): Promise<number> {
+    const user = this.getUser(userId);
+    const sourceKey = user.source ? String(user.source.chatId) : "";
+    const sentKeys = new Set(user.sentItemKeys);
+    const knownIds = new Set([
+      ...user.available.map((item) => item.id),
+      ...user.queue.map((item) => item.id),
+    ]);
+    let added = 0;
+
+    for (const item of items) {
+      user.lastSeenMessageId = Math.max(user.lastSeenMessageId ?? 0, item.messageId);
+      if (knownIds.has(item.id)) continue;
+      if (sentKeys.has(`${sourceKey}:${item.messageId}`)) {
+        user.duplicateCount += 1;
+        knownIds.add(item.id);
+        continue;
+      }
+
+      const queuedItem = { ...item, status: "pending" as const, error: undefined };
+      user.available.push(queuedItem);
+      user.queue.push(queuedItem);
+      knownIds.add(item.id);
+      added += 1;
+    }
+
+    if (lastSeenMessageId !== undefined) {
+      user.lastSeenMessageId = Math.max(user.lastSeenMessageId ?? 0, lastSeenMessageId);
+    }
+    if (user.available.length > 25_000) {
+      user.available.splice(0, user.available.length - 25_000);
+    }
+    await this.save();
+    return added;
   }
 
   async setSelection(userId: number, selectedIds: string[]) {
@@ -338,6 +394,7 @@ export class StateStore {
     this.state.users[String(userId)] = {
       ...emptyUser(userId),
       authorized: current.authorized,
+      liveMode: current.liveMode,
       language: current.language,
       notifyOnComplete: current.notifyOnComplete,
       transferSpeed: current.transferSpeed,
