@@ -12,6 +12,7 @@ BOT_TOKEN=your_BotFather_token
 API_ID=your_my_telegram_org_api_id
 API_HASH=your_my_telegram_org_api_hash
 DATA_DIR=/data
+TRANSFER_ITEM_TIMEOUT_MS=120000
 NODE_ENV=production
 LOG_LEVEL=info
 ```

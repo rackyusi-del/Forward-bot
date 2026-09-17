@@ -14,6 +14,7 @@ import { itemName, matchesContentType, messageContentType } from "./filter";
 type Prompt = (question: string) => Promise<string>;
 type Progress = (completed: number, total: number, name: string) => Promise<void>;
 type IsCancelled = () => boolean;
+const DEFAULT_TRANSFER_ITEM_TIMEOUT_MS = 120_000;
 
 export interface DiscoveryResult {
   items: QueueItem[];
@@ -91,10 +92,7 @@ export class TelegramUserClient {
     const client = this.clients.get(userId);
     if (!client) return;
 
-    this.clients.delete(userId);
-    void client.disconnect().catch((error) => {
-      logger.debug({ userId, err: error }, "Telegram transfer client was already disconnected");
-    });
+    this.abandonClient(userId, client);
   }
 
   async discover(
@@ -154,39 +152,60 @@ export class TelegramUserClient {
   ): Promise<void> {
     if (isCancelled()) throw new Error("Transfer was stopped");
     const client = await this.getClient(userId);
-    const sourceEntity = await client.getInputEntity(source.chatId);
-    const targetEntity = await client.getInputEntity(target.chatId);
-    const message = await this.getMessage(client, sourceEntity, item.messageId);
-    if (!message) throw new Error("Source message is no longer available");
+    try {
+      await withTimeout(
+        (async () => {
+          const sourceEntity = await client.getInputEntity(source.chatId);
+          const targetEntity = await client.getInputEntity(target.chatId);
+          const message = await this.getMessage(client, sourceEntity, item.messageId);
+          if (!message) throw new Error("Source message is no longer available");
 
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      try {
-        if (item.type === "messages" && !message.media) {
-          if (!message.message?.trim()) throw new Error("Message has no text");
-          if (isCancelled()) throw new Error("Transfer was stopped");
-          await client.sendMessage(targetEntity, {
-            message: message.message,
-            replyTo: target.threadId,
-          });
-        } else if (message.media) {
-          if (isCancelled()) throw new Error("Transfer was stopped");
-          await client.sendFile(targetEntity, {
-            file: message.media,
-            caption: message.message || undefined,
-            forceDocument: item.type === "files",
-            replyTo: target.threadId,
-          });
-        } else {
-          throw new Error("Source media is unavailable");
-        }
-        return;
-      } catch (error) {
-        if (isCancelled()) throw error;
-        const seconds = floodWaitSeconds(error);
-        if (seconds === undefined || attempt >= 3) throw error;
-        await pause(Math.max(1, seconds) * 1_000);
+          for (let attempt = 0; attempt < 4; attempt += 1) {
+            try {
+              if (item.type === "messages" && !message.media) {
+                if (!message.message?.trim()) throw new Error("Message has no text");
+                if (isCancelled()) throw new Error("Transfer was stopped");
+                await client.sendMessage(targetEntity, {
+                  message: message.message,
+                  replyTo: target.threadId,
+                });
+              } else if (message.media) {
+                if (isCancelled()) throw new Error("Transfer was stopped");
+                await client.sendFile(targetEntity, {
+                  file: message.media,
+                  caption: message.message || undefined,
+                  forceDocument: item.type === "files",
+                  replyTo: target.threadId,
+                });
+              } else {
+                throw new Error("Source media is unavailable");
+              }
+              return;
+            } catch (error) {
+              if (isCancelled()) throw error;
+              const seconds = floodWaitSeconds(error);
+              if (seconds === undefined || attempt >= 3) throw error;
+              await pause(Math.max(1, seconds) * 1_000);
+            }
+          }
+        })(),
+        transferItemTimeoutMs(),
+        item.name,
+      );
+    } catch (error) {
+      if (error instanceof TransferTimeoutError) {
+        this.abandonClient(userId, client);
       }
+      throw error;
     }
+  }
+
+  private abandonClient(userId: number, client: TelegramClient): void {
+    if (this.clients.get(userId) !== client) return;
+    this.clients.delete(userId);
+    void client.disconnect().catch((error) => {
+      logger.debug({ userId, err: error }, "Telegram transfer client was already disconnected");
+    });
   }
 
   private async getClient(userId: number): Promise<TelegramClient> {
@@ -242,6 +261,43 @@ export class TelegramUserClient {
   private async saveSession(userId: number, session: string): Promise<void> {
     await mkdir(this.dataDirectory, { recursive: true });
     await writeFile(this.sessionPath(userId), session, { encoding: "utf8", mode: 0o600 });
+  }
+}
+
+class TransferTimeoutError extends Error {
+  constructor(itemName: string, timeoutMs: number) {
+    super(
+      `Transfer item "${itemName.slice(0, 100)}" timed out after ${Math.round(timeoutMs / 1000)} seconds`,
+    );
+    this.name = "TransferTimeoutError";
+  }
+}
+
+function transferItemTimeoutMs(): number {
+  const configured = Number(
+    process.env.TRANSFER_ITEM_TIMEOUT_MS ?? DEFAULT_TRANSFER_ITEM_TIMEOUT_MS,
+  );
+  if (!Number.isFinite(configured)) return DEFAULT_TRANSFER_ITEM_TIMEOUT_MS;
+  return Math.min(30 * 60_000, Math.max(30_000, Math.round(configured)));
+}
+
+async function withTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  itemName: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new TransferTimeoutError(itemName, timeoutMs)),
+        timeoutMs,
+      );
+      timer.unref?.();
+      void operation.then(resolve, reject);
+    });
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
