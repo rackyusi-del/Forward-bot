@@ -864,6 +864,7 @@ class ForwardingBot {
             current.target!,
             item,
             () => transferRun.cancelled,
+            current.transferSpeed,
           ),
           () => transferRun.cancelled || !this.state.getUser(userId).running,
         );
@@ -899,7 +900,7 @@ class ForwardingBot {
   }
 
   private transferDelay(speed: number): number {
-    return Math.max(0, Math.round(350 / speed));
+    return speed >= 2 ? 0 : Math.max(0, Math.round(350 / speed));
   }
 
   private async updateProgress(userId: number, currentItem?: QueueItem): Promise<void> {

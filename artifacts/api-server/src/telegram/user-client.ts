@@ -149,6 +149,7 @@ export class TelegramUserClient {
     target: TargetConfig,
     item: QueueItem,
     isCancelled: IsCancelled = () => false,
+    speed = 1,
   ): Promise<void> {
     if (isCancelled()) throw new Error("Transfer was stopped");
     const client = await this.getClient(userId);
@@ -176,6 +177,7 @@ export class TelegramUserClient {
                   caption: message.message || undefined,
                   forceDocument: item.type === "files",
                   replyTo: target.threadId,
+                  workers: uploadWorkerCount(speed),
                 });
               } else {
                 throw new Error("Source media is unavailable");
@@ -315,4 +317,8 @@ function floodWaitSeconds(error: unknown): number | undefined {
 
 function pause(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function uploadWorkerCount(speed: number): number {
+  return Math.min(16, Math.max(1, Math.ceil(speed)));
 }
