@@ -187,6 +187,7 @@ export class TelegramUserClient {
               await client!.sendMessage(targetEntity, {
                 message: message.message,
                 replyTo: target.threadId,
+                topMsgId: target.threadId,
               });
             } else if (message.media) {
               if (isCancelled()) throw new Error("Transfer was stopped");
@@ -195,6 +196,7 @@ export class TelegramUserClient {
                 caption: message.message || undefined,
                 forceDocument: item.type === "files",
                 replyTo: target.threadId,
+                topMsgId: target.threadId,
                 workers: uploadWorkerCount(speed),
               });
             } else {
