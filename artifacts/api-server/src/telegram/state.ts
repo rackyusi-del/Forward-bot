@@ -11,7 +11,12 @@ export type ContentType =
   | "messages"
   | "other";
 
-export type QueueItemStatus = "pending" | "processing" | "completed" | "failed";
+export type QueueItemStatus =
+  | "pending"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "uncertain";
 
 export interface SourceConfig {
   chatId: number | string;
@@ -48,6 +53,7 @@ export interface UserState {
   userId: number;
   authorized: boolean;
   liveMode: boolean;
+  liveModeExplicit: boolean;
   transferSpeed: number;
   language: LanguageCode;
   notifyOnComplete: boolean;
@@ -85,7 +91,8 @@ const emptyState = (): PersistedState => ({
 const emptyUser = (userId: number): UserState => ({
   userId,
   authorized: false,
-  liveMode: true,
+  liveMode: false,
+  liveModeExplicit: false,
   transferSpeed: 1,
   language: "en",
   notifyOnComplete: true,
@@ -111,11 +118,23 @@ export class StateStore {
   }
 
   async load(): Promise<void> {
+    let recoveredProcessing = false;
     try {
       this.state = JSON.parse(await readFile(this.statePath, "utf8")) as PersistedState;
+      if (
+        !this.state ||
+        typeof this.state !== "object" ||
+        !this.state.users ||
+        typeof this.state.users !== "object"
+      ) {
+        throw new Error("Saved Telegram state has an invalid shape");
+      }
       for (const user of Object.values(this.state.users)) {
         user.transferSpeed = normalizeTransferSpeed(user.transferSpeed);
-        user.liveMode ??= true;
+        // `liveMode` used to default to true. Existing state without an
+        // explicit setting is migrated to the safer opt-in behavior.
+        user.liveModeExplicit ??= false;
+        if (!user.liveModeExplicit) user.liveMode = false;
         user.language ??= "en";
         user.notifyOnComplete ??= true;
         user.duplicateCount ??= 0;
@@ -123,7 +142,15 @@ export class StateStore {
         user.history ??= [];
         user.running = false;
         for (const item of user.queue) {
-          if (item.status === "processing") item.status = "pending";
+          if (item.status === "processing") {
+            // A process can die after Telegram accepted the request but
+            // before the completed checkpoint reached disk. Retrying here
+            // would be an unconfirmed duplicate, so surface it instead.
+            item.status = "uncertain";
+            item.error =
+              "The previous process stopped during delivery; verify Telegram before retrying.";
+            recoveredProcessing = true;
+          }
         }
       }
     } catch (error) {
@@ -131,11 +158,16 @@ export class StateStore {
         typeof error === "object" && error !== null && "code" in error
           ? (error as { code?: string }).code
           : undefined;
-      if (code !== "ENOENT") {
-        logger.warn({ err: error }, "Could not read saved Telegram state");
+      if (code === "ENOENT") {
+        this.state = emptyState();
+      } else {
+        logger.error({ err: error }, "Saved Telegram state is corrupt; refusing to overwrite it");
+        throw new Error(
+          "Saved Telegram state is corrupt. The service stopped without replacing it; restore the state file or move it aside manually.",
+        );
       }
-      this.state = emptyState();
     }
+    if (recoveredProcessing) await this.checkpoint();
   }
 
   get offset() {
@@ -210,7 +242,9 @@ export class StateStore {
   }
 
   async setLiveMode(userId: number, enabled: boolean) {
-    this.getUser(userId).liveMode = enabled;
+    const user = this.getUser(userId);
+    user.liveMode = enabled;
+    user.liveModeExplicit = true;
     await this.save();
   }
 
@@ -359,7 +393,7 @@ export class StateStore {
     if (user.sentItemKeys.length > 10_000) {
       user.sentItemKeys.splice(0, user.sentItemKeys.length - 10_000);
     }
-    await this.save();
+    await this.checkpoint();
   }
 
   async skipNext(userId: number): Promise<QueueItem | undefined> {
@@ -388,6 +422,19 @@ export class StateStore {
     await this.save();
   }
 
+  async claimPending(
+    userId: number,
+    limit: number,
+  ): Promise<QueueItem[]> {
+    const user = this.getUser(userId);
+    const items = user.queue
+      .filter((item) => item.status === "pending")
+      .slice(0, Math.max(1, limit));
+    for (const item of items) item.status = "processing";
+    if (items.length) await this.checkpoint();
+    return items;
+  }
+
   async retryFailed(userId: number) {
     const user = this.getUser(userId);
     for (const item of user.queue) {
@@ -405,12 +452,25 @@ export class StateStore {
     let changed = false;
     for (const item of user.queue) {
       if (item.status === "processing") {
-        item.status = "pending";
-        item.error = undefined;
+        item.status = "uncertain";
+        item.error =
+          "The previous Telegram operation was interrupted; verify delivery before retrying.";
         changed = true;
       }
     }
     if (changed) await this.save();
+  }
+
+  async retryUncertain(userId: number) {
+    const user = this.getUser(userId);
+    for (const item of user.queue) {
+      if (item.status === "uncertain") {
+        item.status = "pending";
+        item.error = undefined;
+      }
+    }
+    user.lastError = undefined;
+    await this.save();
   }
 
   async setProgressMessage(
@@ -431,11 +491,12 @@ export class StateStore {
     if (!item) return;
     item.status = status;
     item.error = error;
-    // Processing is an in-memory lock. Persist only the states needed for
-    // recovery; completed items are persisted by markItemSent().
-    if (status !== "processing" && status !== "completed") {
-      await this.save();
-    }
+    await this.save();
+  }
+
+  async checkpoint(): Promise<void> {
+    await this.save();
+    await this.flush();
   }
 
   async setError(userId: number, error: string | undefined) {
@@ -463,6 +524,7 @@ export class StateStore {
       language: current.language,
       notifyOnComplete: current.notifyOnComplete,
       transferSpeed: current.transferSpeed,
+      liveModeExplicit: current.liveModeExplicit,
     };
     await this.save();
   }

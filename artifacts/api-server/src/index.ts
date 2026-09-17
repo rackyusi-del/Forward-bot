@@ -26,17 +26,28 @@ app.listen(port, (err) => {
   void runTelegramBotSupervisor();
 });
 
+let shuttingDown = false;
+process.once("SIGTERM", () => {
+  shuttingDown = true;
+});
+process.once("SIGINT", () => {
+  shuttingDown = true;
+});
+
 async function runTelegramBotSupervisor(): Promise<void> {
   let retryDelayMs = 5_000;
 
-  while (true) {
+  while (!shuttingDown) {
     try {
       await startTelegramBot();
+      if (shuttingDown) break;
       logger.warn("Telegram bot listener exited; restarting it");
     } catch (error) {
+      if (shuttingDown) break;
       logger.error({ err: error }, "Telegram bot listener failed; restarting it");
     }
 
+    if (shuttingDown) break;
     await pause(retryDelayMs);
     retryDelayMs = Math.min(60_000, retryDelayMs * 2);
   }

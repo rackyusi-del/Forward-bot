@@ -32,9 +32,10 @@ because they take longer than a fixed number of minutes. A timed-out request
 cannot be safely retried because Telegram may already have accepted it, so the
 bot does not automatically retry a request whose delivery result is unknown.
 The queue checkpoints each item immediately after Telegram confirms it.
-`TRANSFER_STALL_TIMEOUT_MS` is a separate safety watchdog. If a Telegram
-operation stops making progress for that long, the active item is released back
-to `pending`, the run is paused, and `/on` or `/retry` can start it cleanly.
+`TRANSFER_STALL_TIMEOUT_MS` is a separate safety watchdog. It tracks worker
+progress and never disconnects a healthy long-running Telegram upload. If no
+worker progress is detected while no Telegram operation is in flight, the queue
+is checkpointed and resumed by the supervisor.
 
 Attach a persistent Railway Volume mounted at `/data`. The bot writes:
 
@@ -69,11 +70,13 @@ chat permissions, Telegram rate limits, or sender identity restrictions.
 8. Use `/queue`, `/status`, `/history`, `/stats` and `/logs` to monitor the job.
 9. Use `/filter`, `/maxsize`, `/duplicates`, `/retry` and `/skip` to control it.
 10. Use `/schedule`, `/notify`, `/destination`, `/settings` and `/language`.
-11. Use `/stop` to pause, `/on` to continue from the saved queue, `/cancel`,
+11. Use `/stop` to pause, `/on` only as an emergency manual resume, `/cancel`,
     `/reset` and `/logout` as needed.
-12. Live source monitoring is enabled by default. Use `/live off` to finish the
-    current queue without adding newly arriving matching files, or `/live on` to
-    enable it again.
+12. Live source monitoring is opt-in. Use `/live on` to watch for new matching
+    files, or `/live off` to stop the watcher.
+13. If Telegram reports an uncertain delivery, verify that item before using
+    `/retry_uncertain`; uncertain items are never resent automatically.
 
 The queue is persisted after every item state transition. Completed items are
-never selected again; failed items are retried only when `/resume` is used.
+never selected again. A restart resumes pending work automatically, while
+interrupted deliveries are marked uncertain instead of being blindly duplicated.

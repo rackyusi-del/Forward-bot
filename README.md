@@ -20,16 +20,20 @@ sending selected content.
     matching files in the source
 11. Use `/stop` to pause, `/on` to continue from the saved queue, `/cancel`,
     `/reset` and `/logout` as needed
+12. Use `/retry_uncertain` only after checking an item whose Telegram delivery
+    could not be confirmed
 
 Each Telegram user has an isolated session, source, destination, queue and
 checkpoint. Completed queue items are not selected again after restarts. Higher
 transfer speeds use bounded parallel workers and a shorter inter-item delay;
 slower speeds add a longer inter-item delay. Telegram flood-wait responses are
-still respected.
+still respected. Pending work resumes automatically after a process restart.
+Interrupted deliveries are marked uncertain instead of being resent blindly.
 
-Regular destination chats use Telegram's native multi-message forwarding in
-batches of up to 100 items. Forum-topic destinations keep the single-item path
-so each message is attached to the requested topic correctly.
+The transfer engine reserves only small item windows and checkpoints each
+successful item independently. It does not use a native multi-message forward,
+because Telegram can partially accept that request without telling the client
+which messages arrived.
 
 The language menu supports English, Hindi, Spanish, French, German, Portuguese,
 Arabic, Bengali, Russian and Chinese. User preferences, history, duplicate

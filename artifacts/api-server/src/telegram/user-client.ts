@@ -14,6 +14,7 @@ import { itemName, matchesContentType, messageContentType } from "./filter";
 type Prompt = (question: string) => Promise<string>;
 type Progress = (completed: number, total: number, name: string) => Promise<void>;
 type IsCancelled = () => boolean;
+export type Heartbeat = () => void;
 // A timeout cannot cancel a GramJS request that has already reached Telegram.
 // Therefore the safe default is no artificial per-item timeout. The separate
 // transfer watchdog handles a genuinely stalled run without automatically
@@ -25,6 +26,16 @@ export interface DiscoveryResult {
   items: QueueItem[];
   truncated: boolean;
   latestMessageId?: number;
+}
+
+export class UncertainTransferError extends Error {
+  constructor(cause: unknown) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    super(
+      `Telegram delivery result is uncertain after a connection failure: ${message.slice(0, 180)}`,
+    );
+    this.name = "UncertainTransferError";
+  }
 }
 
 export class TelegramUserClient {
@@ -49,7 +60,7 @@ export class TelegramUserClient {
         new StringSession(await this.readSession(userId)),
         apiId,
         apiHash,
-        { connectionRetries: 5 },
+        { connectionRetries: 10 },
       );
 
       await client.start({
@@ -166,54 +177,62 @@ export class TelegramUserClient {
     item: QueueItem,
     isCancelled: IsCancelled = () => false,
     speed = 1,
+    heartbeat: Heartbeat = () => undefined,
   ): Promise<void> {
     if (isCancelled()) throw new Error("Transfer was stopped");
     const timeoutMs = transferItemTimeoutMs();
 
     for (let attempt = 0; attempt < MAX_TRANSFER_ATTEMPTS; attempt += 1) {
       let client: TelegramClient | undefined;
+      let sendStarted = false;
       try {
         client = await this.getClient(userId);
-        await withTimeout(
-          (async () => {
-            const sourceEntity = await client!.getInputEntity(source.chatId);
-            const targetEntity = await client!.getInputEntity(target.chatId);
-            const message = await this.getMessage(client!, sourceEntity, item.messageId);
-            if (!message) throw new Error("Source message is no longer available");
+        const sourceEntity = await client.getInputEntity(source.chatId);
+        const targetEntity = await client.getInputEntity(target.chatId);
+        const message = await this.getMessage(client, sourceEntity, item.messageId);
+        if (!message) throw new Error("Source message is no longer available");
 
-            if (item.type === "messages" && !message.media) {
-              if (!message.message?.trim()) throw new Error("Message has no text");
-              if (isCancelled()) throw new Error("Transfer was stopped");
-              await client!.sendMessage(targetEntity, {
-                message: message.message,
-                replyTo: target.threadId,
-                topMsgId: target.threadId,
-              });
-            } else if (message.media) {
-              if (isCancelled()) throw new Error("Transfer was stopped");
-              await client!.sendFile(targetEntity, {
-                file: message.media,
-                caption: message.message || undefined,
-                forceDocument: item.type === "files",
-                replyTo: target.threadId,
-                topMsgId: target.threadId,
-                workers: uploadWorkerCount(speed),
-              });
-            } else {
-              throw new Error("Source media is unavailable");
-            }
-          })(),
-          timeoutMs,
-          item.name,
-        );
+        if (item.type === "messages" && !message.media) {
+          if (!message.message?.trim()) throw new Error("Message has no text");
+          if (isCancelled()) throw new Error("Transfer was stopped");
+          sendStarted = true;
+          await withTimeout(
+            withHeartbeat(
+              () =>
+                client!.sendMessage(targetEntity, {
+                  message: message.message,
+                  replyTo: target.threadId,
+                  topMsgId: target.threadId,
+                }),
+              heartbeat,
+            ),
+            timeoutMs,
+            item.name,
+          );
+        } else if (message.media) {
+          if (isCancelled()) throw new Error("Transfer was stopped");
+          sendStarted = true;
+          await withTimeout(
+            withHeartbeat(
+              () =>
+                client!.sendFile(targetEntity, {
+                  file: message.media,
+                  caption: message.message || undefined,
+                  forceDocument: item.type === "files",
+                  replyTo: target.threadId,
+                  topMsgId: target.threadId,
+                  workers: uploadWorkerCount(speed),
+                }),
+              heartbeat,
+            ),
+            timeoutMs,
+            item.name,
+          );
+        } else {
+          throw new Error("Source media is unavailable");
+        }
         return;
       } catch (error) {
-        if (error instanceof TransferTimeoutError && client) {
-          await this.abandonClient(userId, client);
-          // The request may have reached Telegram before the local timer
-          // fired. Retrying automatically could create a duplicate delivery.
-          throw error;
-        }
         if (isCancelled()) throw error;
         const seconds = floodWaitSeconds(error);
         if (seconds !== undefined) {
@@ -225,15 +244,28 @@ export class TelegramUserClient {
           await pause(Math.max(1, seconds) * 1_000);
           continue;
         }
-        if (
-          !(error instanceof TransferTimeoutError) &&
-          (!isRetryableTransferError(error) || attempt >= MAX_TRANSFER_ATTEMPTS - 1)
-        ) {
-          throw error;
+        if (error instanceof TransferTimeoutError || isRetryableTransferError(error)) {
+          if (sendStarted) {
+            // Telegram may have accepted the request before the connection
+            // failed. Reconnect for the next item, but never resend this one
+            // without an explicit user decision.
+            await this.reconnect(userId).catch((reconnectError) => {
+              logger.warn(
+                { userId, err: reconnectError },
+                "Telegram reconnect failed after uncertain delivery",
+              );
+            });
+            throw new UncertainTransferError(error);
+          }
+          if (attempt >= MAX_TRANSFER_ATTEMPTS - 1) throw error;
+          await this.reconnect(userId).catch(() => undefined);
+          await pause(retryDelayMs(attempt));
+          continue;
         }
-        await pause(retryDelayMs(attempt));
+        throw error;
       }
     }
+    throw new Error(`Transfer item "${item.name}" exhausted retries`);
   }
 
   async sendBatch(
@@ -242,70 +274,21 @@ export class TelegramUserClient {
     target: TargetConfig,
     items: QueueItem[],
     isCancelled: IsCancelled = () => false,
+    heartbeat: Heartbeat = () => undefined,
+    speed = 1,
   ): Promise<void> {
-    if (!items.length) return;
-
-    // Telegram's native batch forward cannot target a specific forum topic in
-    // this GramJS version. Keep the old per-item path for that case so topic
-    // delivery remains correct.
-    if (target.threadId !== undefined) {
-      for (const item of items) {
-        await this.sendItem(userId, source, target, item, isCancelled);
-      }
-      return;
+    // A native multi-message forward has an ambiguous partial-success result.
+    // Keep this method for callers, but make its unit of work one item so each
+    // successful delivery can be checkpointed independently.
+    for (const item of items) {
+      await this.sendItem(userId, source, target, item, isCancelled, speed, heartbeat);
     }
+  }
 
-    const timeoutMs = transferItemTimeoutMs();
-    const messageIds = items.map((item) => item.messageId);
-
-    for (let attempt = 0; attempt < MAX_TRANSFER_ATTEMPTS; attempt += 1) {
-      let client: TelegramClient | undefined;
-      try {
-        client = await this.getClient(userId);
-        await withTimeout(
-          (async () => {
-            if (isCancelled()) throw new Error("Transfer was stopped");
-            const sourceEntity = await client!.getInputEntity(source.chatId);
-            const targetEntity = await client!.getInputEntity(target.chatId);
-            await client!.forwardMessages(targetEntity, {
-              messages: messageIds,
-              fromPeer: sourceEntity,
-              dropAuthor: true,
-            });
-          })(),
-          timeoutMs,
-          `batch of ${items.length} items`,
-        );
-        return;
-      } catch (error) {
-        if (error instanceof TransferTimeoutError && client) {
-          await this.abandonClient(userId, client);
-          // The request may have reached Telegram before the local timer
-          // fired. Retrying automatically could create a duplicate delivery.
-          throw error;
-        }
-        if (isCancelled()) throw error;
-        const seconds = floodWaitSeconds(error);
-        if (seconds !== undefined) {
-          logger.warn(
-            { userId, batchSize: items.length, waitSeconds: seconds },
-            "Telegram FloodWait; pausing this batch before retry",
-          );
-          if (attempt >= MAX_TRANSFER_ATTEMPTS - 1) throw error;
-          await pause(Math.max(1, seconds) * 1_000);
-          continue;
-        }
-        if (
-          !(error instanceof TransferTimeoutError) &&
-          (!isRetryableTransferError(error) || attempt >= MAX_TRANSFER_ATTEMPTS - 1)
-        ) {
-          throw error;
-        }
-        await pause(retryDelayMs(attempt));
-      }
-    }
-
-    throw new Error(`Batch of ${items.length} items exhausted retries`);
+  async reconnect(userId: number): Promise<void> {
+    const client = this.clients.get(userId);
+    if (client) await this.abandonClient(userId, client);
+    await this.getClient(userId);
   }
 
   private async abandonClient(userId: number, client: TelegramClient): Promise<void> {
@@ -324,7 +307,7 @@ export class TelegramUserClient {
       new StringSession(await this.readSession(userId)),
       this.getApiId(),
       this.getApiHash(),
-      { connectionRetries: 5 },
+      { connectionRetries: 10 },
     );
     await client.connect();
     if (!(await client.checkAuthorization())) {
@@ -447,6 +430,21 @@ function floodWaitSeconds(error: unknown): number | undefined {
 
 function pause(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function withHeartbeat<T>(
+  operation: () => Promise<T>,
+  heartbeat: Heartbeat,
+): Promise<T> {
+  heartbeat();
+  const timer = setInterval(heartbeat, 15_000);
+  timer.unref?.();
+  try {
+    return await operation();
+  } finally {
+    clearInterval(timer);
+    heartbeat();
+  }
 }
 
 function uploadWorkerCount(speed: number): number {

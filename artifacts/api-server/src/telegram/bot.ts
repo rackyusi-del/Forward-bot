@@ -8,7 +8,11 @@ import {
   type UserState,
 } from "./state";
 import type { TelegramCallbackQuery, TelegramMessage, TelegramUpdate } from "./types";
-import { TelegramUserClient } from "./user-client";
+import {
+  TelegramUserClient,
+  UncertainTransferError,
+  type Heartbeat,
+} from "./user-client";
 import { parseTelegramSourceUrl } from "./url";
 import {
   languageLabel,
@@ -63,6 +67,15 @@ interface TransferRun {
   done: Promise<void>;
   resolveDone: () => void;
   lastActivityAt: number;
+  operationInFlight: boolean;
+}
+
+interface LiveWatcher {
+  cancelled: boolean;
+  done: Promise<void>;
+  resolveDone: () => void;
+  notifyChatId: number;
+  notifyThreadId?: number;
 }
 
 export async function startTelegramBot(): Promise<void> {
@@ -84,6 +97,7 @@ class ForwardingBot {
   private stopping = false;
   private readonly pendingInputs = new Map<number, PendingInput>();
   private readonly transferRuns = new Map<number, TransferRun>();
+  private readonly liveWatchers = new Map<number, LiveWatcher>();
   private readonly scheduleTimers = new Map<number, NodeJS.Timeout>();
   private readonly lastProgressUpdateAt = new Map<number, number>();
   private updateChain: Promise<void> = Promise.resolve();
@@ -108,6 +122,7 @@ class ForwardingBot {
         { command: "stats", description: "Show transfer statistics" },
         { command: "logs", description: "Show recent errors" },
         { command: "retry", description: "Retry failed items" },
+         { command: "retry_uncertain", description: "Retry verified uncertain items" },
         { command: "skip", description: "Skip next pending item" },
         { command: "stop", description: "Pause transfer" },
          { command: "on", description: "Resume transfer" },
@@ -127,6 +142,7 @@ class ForwardingBot {
       .catch((error) => logger.warn({ err: error }, "Could not register Telegram commands"));
     await this.api.deleteWebhook();
     await this.restoreSchedules();
+    await this.restoreLiveWatchersAndQueues();
     logger.info(
       { username: bot.username ?? bot.first_name },
       "Telegram polling started",
@@ -219,7 +235,13 @@ class ForwardingBot {
       if (value !== "on" && value !== "off") {
         await this.api.sendMessage(message.chat.id, "Usage: /live on or /live off");
       } else {
-        await this.state.setLiveMode(userId, value === "on");
+        const enabled = value === "on";
+        await this.state.setLiveMode(userId, enabled);
+        if (enabled) {
+          this.startLiveWatcher(userId, message.chat.id, message.message_thread_id);
+        } else {
+          await this.stopLiveWatcher(userId);
+        }
         await this.api.sendMessage(
           message.chat.id,
           value === "on"
@@ -239,6 +261,17 @@ class ForwardingBot {
       await this.stopExistingTransfer(userId);
       await this.state.retryFailed(userId);
       await this.api.sendMessage(message.chat.id, translate(user.language, "transferResumed"));
+      void this.startTransfer(userId, message.chat.id, message.message_thread_id);
+      return true;
+    }
+
+    if (command === "/retry_uncertain" || command === "/retryuncertain") {
+      await this.stopExistingTransfer(userId);
+      await this.state.retryUncertain(userId);
+      await this.api.sendMessage(
+        message.chat.id,
+        "Uncertain items were released. Use this only after checking that Telegram did not receive them.",
+      );
       void this.startTransfer(userId, message.chat.id, message.message_thread_id);
       return true;
     }
@@ -832,6 +865,7 @@ class ForwardingBot {
       done,
       resolveDone,
       lastActivityAt: Date.now(),
+      operationInFlight: false,
     };
     this.transferRuns.set(userId, transferRun);
     await this.state.setRunning(userId, true);
@@ -852,7 +886,6 @@ class ForwardingBot {
       );
       await Promise.all([
         ...workers,
-        this.watchLiveSource(userId, transferRun, notifyChatId, notifyThreadId),
         this.watchTransferHealth(userId, transferRun, notifyChatId, notifyThreadId),
       ]);
 
@@ -910,74 +943,65 @@ class ForwardingBot {
         await pause(250);
         continue;
       }
-      const pendingItems = user.queue
-        .filter((candidate) => candidate.status === "pending")
-        .slice(0, user.target?.threadId === undefined ? TRANSFER_BATCH_SIZE : 1);
+      const pendingItems = await this.state.claimPending(
+        userId,
+        user.target?.threadId === undefined ? TRANSFER_BATCH_SIZE : 1,
+      );
       if (!pendingItems.length) {
-        if (!user.liveMode) return;
-        await pause(1_000);
-        continue;
+        return;
       }
 
-      for (const item of pendingItems) {
-        await this.state.setItemStatus(userId, item.id, "processing");
-      }
       transferRun.lastActivityAt = Date.now();
       await this.updateProgress(userId, pendingItems[0]);
-      try {
+      for (const item of pendingItems) {
+        if (transferRun.cancelled || !this.state.getUser(userId).running) {
+          await this.state.setItemStatus(userId, item.id, "pending");
+          continue;
+        }
+
         const current = this.state.getUser(userId);
-        // Commit each item immediately after Telegram confirms that item.
-        // A batch-level checkpoint can duplicate every already-delivered item
-        // when the connection fails halfway through a large request.
-        for (const item of pendingItems) {
-          if (transferRun.cancelled || !this.state.getUser(userId).running) return;
+        const heartbeat: Heartbeat = () => {
           transferRun.lastActivityAt = Date.now();
-          await this.userClient.sendBatch(
+        };
+        transferRun.operationInFlight = true;
+        heartbeat();
+        try {
+          await this.userClient.sendItem(
             userId,
             current.source!,
             current.target!,
-            [item],
+            item,
             () => transferRun.cancelled,
+            speed,
+            heartbeat,
           );
           if (!this.isCurrentTransferRun(userId, transferRun)) return;
           await this.state.markItemSent(userId, item);
-          transferRun.lastActivityAt = Date.now();
-        }
-      } catch (error) {
-        const stopped = transferRun.cancelled || !this.state.getUser(userId).running;
-        if (!this.isCurrentTransferRun(userId, transferRun)) return;
-        const remainingItems = pendingItems.filter((item) => {
-          const currentItem = this.state
-            .getUser(userId)
-            .queue.find((candidate) => candidate.id === item.id);
-          return currentItem?.status === "processing";
-        });
-        for (const item of remainingItems) {
-          await this.state.setItemStatus(
-            userId,
-            item.id,
-            stopped ? "pending" : "failed",
-            stopped ? undefined : safeError(error),
-          );
-        }
-        if (!stopped) {
+        } catch (error) {
+          if (!this.isCurrentTransferRun(userId, transferRun)) return;
+          const stopped = transferRun.cancelled || !this.state.getUser(userId).running;
+          if (stopped) {
+            await this.state.setItemStatus(userId, item.id, "pending");
+            continue;
+          }
+
+          const status = error instanceof UncertainTransferError ? "uncertain" : "failed";
+          await this.state.setItemStatus(userId, item.id, status, safeError(error));
           await this.state.setError(userId, safeError(error));
           logger.warn(
-            {
-              userId,
-              itemId: pendingItems.length === 1 ? pendingItems[0].id : "batch",
-              batchSize: pendingItems.length,
-              err: error,
-            },
-            "Transfer item batch failed",
+            { userId, itemId: item.id, status, err: error },
+            "Transfer item failed",
           );
+        } finally {
+          transferRun.operationInFlight = false;
+          transferRun.lastActivityAt = Date.now();
         }
-      } finally {
-        transferRun.lastActivityAt = Date.now();
+        await this.updateProgress(userId, item);
+        if (!transferRun.cancelled) {
+          await pause(this.transferDelay(this.state.getUser(userId).transferSpeed));
+        }
       }
-      if (transferRun.cancelled) return;
       await this.updateProgress(userId);
-      await pause(this.transferDelay(this.state.getUser(userId).transferSpeed));
     }
   }
 
@@ -985,25 +1009,69 @@ class ForwardingBot {
     return this.transferRuns.get(userId) === transferRun;
   }
 
-  private async watchLiveSource(
+  private startLiveWatcher(
     userId: number,
-    transferRun: TransferRun,
     notifyChatId: number,
     notifyThreadId?: number,
-  ): Promise<void> {
-    while (!transferRun.cancelled && this.state.getUser(userId).running) {
+  ): void {
+    if (this.liveWatchers.has(userId)) return;
+
+    let resolveDone!: () => void;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const watcher: LiveWatcher = {
+      cancelled: false,
+      done,
+      resolveDone,
+      notifyChatId,
+      notifyThreadId,
+    };
+    this.liveWatchers.set(userId, watcher);
+    void this.watchLiveSource(userId, watcher).finally(() => {
+      if (this.liveWatchers.get(userId) === watcher) {
+        this.liveWatchers.delete(userId);
+      }
+      watcher.resolveDone();
+    });
+  }
+
+  private async stopLiveWatcher(userId: number): Promise<void> {
+    const watcher = this.liveWatchers.get(userId);
+    if (!watcher) return;
+    watcher.cancelled = true;
+    await watcher.done;
+  }
+
+  private async restoreLiveWatchersAndQueues(): Promise<void> {
+    for (const user of this.state.listUsers()) {
+      if (
+        user.liveMode &&
+        user.source &&
+        user.contentType &&
+        user.authorized
+      ) {
+        this.startLiveWatcher(user.userId, user.userId);
+      }
+      if (
+        user.target &&
+        user.source &&
+        user.authorized &&
+        user.queue.some((item) => item.status === "pending") &&
+        !user.queue.some((item) => item.status === "uncertain")
+      ) {
+        void this.startTransfer(user.userId, user.userId, user.target.threadId);
+      }
+    }
+  }
+
+  private async watchLiveSource(userId: number, watcher: LiveWatcher): Promise<void> {
+    while (!watcher.cancelled && this.state.getUser(userId).liveMode) {
       await pause(LIVE_POLL_INTERVAL_MS);
-      if (transferRun.cancelled || !this.state.getUser(userId).running) return;
+      if (watcher.cancelled || !this.state.getUser(userId).liveMode) return;
 
       const user = this.state.getUser(userId);
-      if (!user.liveMode) {
-        const hasWork = user.queue.some(
-          (item) => item.status === "pending" || item.status === "processing",
-        );
-        if (!hasWork) return;
-        continue;
-      }
-      if (!user.source || !user.contentType) continue;
+      if (!user.authorized || !user.source || !user.contentType) continue;
 
       try {
         const result = await this.userClient.discover(userId, user.source, user.contentType, {
@@ -1019,14 +1087,21 @@ class ForwardingBot {
         if (added > 0) {
           const current = this.state.getUser(userId);
           await this.api.sendMessage(
-            notifyChatId,
+            watcher.notifyChatId,
             `Live update: ${added} new ${contentLabel(user.contentType).toLowerCase()} added.\nQueue: ${current.queue.length} items.`,
-            { threadId: notifyThreadId },
+            { threadId: watcher.notifyThreadId },
           );
+          if (
+            current.target &&
+            !this.transferRuns.has(userId) &&
+            current.queue.some((item) => item.status === "pending")
+          ) {
+            void this.startTransfer(userId, watcher.notifyChatId, watcher.notifyThreadId);
+          }
         }
       } catch (error) {
         await this.state.setError(userId, safeError(error));
-        logger.warn({ userId, err: error }, "Live source poll failed; transfer will continue");
+        logger.warn({ userId, err: error }, "Live source poll failed; watcher will continue");
       }
     }
   }
@@ -1045,7 +1120,12 @@ class ForwardingBot {
       const hasActiveItems = user.queue.some(
         (item) => item.status === "pending" || item.status === "processing",
       );
-      if (!hasActiveItems) continue;
+      if (!hasActiveItems) return;
+
+      // A long Telegram upload is healthy work, not a stall. The transfer
+      // operation sends heartbeats while it is in flight, and the watchdog
+      // never disconnects an active request.
+      if (transferRun.operationInFlight) continue;
 
       if (Date.now() - transferRun.lastActivityAt <= TRANSFER_STALL_TIMEOUT_MS) {
         continue;
@@ -1060,12 +1140,12 @@ class ForwardingBot {
           TRANSFER_STALL_TIMEOUT_MS / 60_000,
         )} minutes`,
       );
-      await this.userClient.stopTransfer(userId);
       await this.api.sendMessage(
         notifyChatId,
-        "Transfer got stuck, so I safely released the active item and paused the queue. Send /on or /retry to continue.",
+        "Transfer paused safely because no worker progress was detected. The queue is saved and will resume automatically after the Telegram connection recovers.",
         { threadId: notifyThreadId },
       );
+      void this.startTransfer(userId, notifyChatId, notifyThreadId);
       return;
     }
   }
@@ -1144,14 +1224,19 @@ class ForwardingBot {
   private summaryText(user: UserState): string {
     const completed = user.queue.filter((item) => item.status === "completed").length;
     const failed = user.queue.filter((item) => item.status === "failed").length;
+    const uncertain = user.queue.filter((item) => item.status === "uncertain").length;
     return [
       "Transfer Completed",
       "",
       `Total: ${user.queue.length}`,
       `Sent: ${completed}`,
       `Failed: ${failed}`,
+      `Uncertain: ${uncertain}`,
+      uncertain
+        ? "Some items were not retried automatically because Telegram delivery could not be confirmed. Verify them before /retry_uncertain."
+        : "",
       "Skipped: 0",
-    ].join("\n");
+    ].filter(Boolean).join("\n");
   }
 
   private contentKeyboard() {
@@ -1202,6 +1287,7 @@ class ForwardingBot {
       pending: user.queue.filter((item) => item.status === "pending").length,
       processing: user.queue.filter((item) => item.status === "processing").length,
       failed: user.queue.filter((item) => item.status === "failed").length,
+      uncertain: user.queue.filter((item) => item.status === "uncertain").length,
     };
     const preview = user.queue
       .filter((item) => item.status !== "completed")
@@ -1214,6 +1300,7 @@ class ForwardingBot {
       `Processing: ${counts.processing}`,
       `Pending: ${counts.pending}`,
       `Failed: ${counts.failed}`,
+      `Uncertain: ${counts.uncertain}`,
       "",
       preview || "All queued items are completed.",
     ].join("\n");
@@ -1277,6 +1364,7 @@ class ForwardingBot {
       "7. Use /queue, /history, /stats, /settings and /logs.",
       "8. Use /live on or /live off to control automatic new-file monitoring.",
       "9. Use /stop to pause and /on to continue, or /cancel to clear the queue.",
+      "10. Uncertain deliveries are never resent automatically; verify them before /retry_uncertain.",
       "",
       "Every Telegram user has a separate session, source, destination and checkpoint.",
       "Only chats your authorized Telegram account can access are supported.",
@@ -1287,6 +1375,7 @@ class ForwardingBot {
     const completed = user.queue.filter((item) => item.status === "completed").length;
     const pending = user.queue.filter((item) => item.status === "pending").length;
     const failed = user.queue.filter((item) => item.status === "failed").length;
+    const uncertain = user.queue.filter((item) => item.status === "uncertain").length;
     const processing = user.queue.find((item) => item.status === "processing");
     return [
       `Account: ${user.authorized ? "verified" : "not verified"}`,
@@ -1301,6 +1390,7 @@ class ForwardingBot {
       `Completed: ${completed}`,
       `Pending: ${pending}`,
       `Failed: ${failed}`,
+      `Uncertain: ${uncertain}`,
       `Current item: ${processing?.name ?? "none"}`,
       user.lastError ? `Last error: ${user.lastError}` : "",
     ]
