@@ -337,12 +337,27 @@ export class StateStore {
   }
 
   async markItemSent(userId: number, item: QueueItem) {
+    await this.markItemsSent(userId, [item]);
+  }
+
+  async markItemsSent(userId: number, items: QueueItem[]) {
     const user = this.getUser(userId);
     const sourceKey = user.source ? String(user.source.chatId) : "";
-    const key = `${sourceKey}:${item.messageId}`;
-    if (!user.sentItemKeys.includes(key)) {
-      user.sentItemKeys.push(key);
-      if (user.sentItemKeys.length > 10_000) user.sentItemKeys.splice(0, 1_000);
+    const itemIds = new Set(items.map((item) => item.id));
+    for (const queuedItem of user.queue) {
+      if (itemIds.has(queuedItem.id)) {
+        queuedItem.status = "completed";
+        queuedItem.error = undefined;
+      }
+    }
+    for (const item of items) {
+      const key = `${sourceKey}:${item.messageId}`;
+      if (!user.sentItemKeys.includes(key)) {
+        user.sentItemKeys.push(key);
+      }
+    }
+    if (user.sentItemKeys.length > 10_000) {
+      user.sentItemKeys.splice(0, user.sentItemKeys.length - 10_000);
     }
     await this.save();
   }

@@ -35,6 +35,7 @@ const transferSpeeds = [
 // Keep account-level concurrency conservative. Telegram may impose a
 // multi-minute FloodWait when several file uploads run in parallel.
 const MAX_TRANSFER_WORKERS = boundedEnvNumber("MAX_TRANSFER_WORKERS", 2, 1, 3);
+const TRANSFER_BATCH_SIZE = boundedEnvNumber("TRANSFER_BATCH_SIZE", 100, 1, 100);
 const LIVE_POLL_INTERVAL_MS = boundedEnvNumber(
   "LIVE_POLL_INTERVAL_MS",
   15_000,
@@ -893,43 +894,55 @@ class ForwardingBot {
         await pause(250);
         continue;
       }
-      const item = user.queue.find((candidate) => candidate.status === "pending");
-      if (!item) {
+      const pendingItems = user.queue
+        .filter((candidate) => candidate.status === "pending")
+        .slice(0, user.target?.threadId === undefined ? TRANSFER_BATCH_SIZE : 1);
+      if (!pendingItems.length) {
         if (!user.liveMode) return;
         await pause(1_000);
         continue;
       }
 
-      await this.state.setItemStatus(userId, item.id, "processing");
-      await this.updateProgress(userId, item);
+      for (const item of pendingItems) {
+        await this.state.setItemStatus(userId, item.id, "processing");
+      }
+      await this.updateProgress(userId, pendingItems[0]);
       try {
         const current = this.state.getUser(userId);
         await waitForCancellation(
-          this.userClient.sendItem(
+          this.userClient.sendBatch(
             userId,
             current.source!,
             current.target!,
-            item,
+            pendingItems,
             () => transferRun.cancelled,
-            current.transferSpeed,
           ),
           () => transferRun.cancelled || !this.state.getUser(userId).running,
         );
         if (!this.isCurrentTransferRun(userId, transferRun)) return;
-        await this.state.setItemStatus(userId, item.id, "completed");
-        await this.state.markItemSent(userId, item);
+        await this.state.markItemsSent(userId, pendingItems);
       } catch (error) {
         const stopped = transferRun.cancelled || !this.state.getUser(userId).running;
         if (!this.isCurrentTransferRun(userId, transferRun)) return;
-        await this.state.setItemStatus(
-          userId,
-          item.id,
-          stopped ? "pending" : "failed",
-          stopped ? undefined : safeError(error),
-        );
+        for (const item of pendingItems) {
+          await this.state.setItemStatus(
+            userId,
+            item.id,
+            stopped ? "pending" : "failed",
+            stopped ? undefined : safeError(error),
+          );
+        }
         if (!stopped) {
           await this.state.setError(userId, safeError(error));
-          logger.warn({ userId, itemId: item.id, err: error }, "Transfer item failed");
+          logger.warn(
+            {
+              userId,
+              itemId: pendingItems.length === 1 ? pendingItems[0].id : "batch",
+              batchSize: pendingItems.length,
+              err: error,
+            },
+            "Transfer item batch failed",
+          );
         }
       }
       if (transferRun.cancelled) return;

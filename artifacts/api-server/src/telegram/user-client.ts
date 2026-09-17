@@ -231,6 +231,75 @@ export class TelegramUserClient {
     }
   }
 
+  async sendBatch(
+    userId: number,
+    source: SourceConfig,
+    target: TargetConfig,
+    items: QueueItem[],
+    isCancelled: IsCancelled = () => false,
+  ): Promise<void> {
+    if (!items.length) return;
+
+    // Telegram's native batch forward cannot target a specific forum topic in
+    // this GramJS version. Keep the old per-item path for that case so topic
+    // delivery remains correct.
+    if (target.threadId !== undefined) {
+      for (const item of items) {
+        await this.sendItem(userId, source, target, item, isCancelled);
+      }
+      return;
+    }
+
+    const timeoutMs = transferItemTimeoutMs();
+    const messageIds = items.map((item) => item.messageId);
+
+    for (let attempt = 0; attempt < MAX_TRANSFER_ATTEMPTS; attempt += 1) {
+      let client: TelegramClient | undefined;
+      try {
+        client = await this.getClient(userId);
+        await withTimeout(
+          (async () => {
+            if (isCancelled()) throw new Error("Transfer was stopped");
+            const sourceEntity = await client!.getInputEntity(source.chatId);
+            const targetEntity = await client!.getInputEntity(target.chatId);
+            await client!.forwardMessages(targetEntity, {
+              messages: messageIds,
+              fromPeer: sourceEntity,
+              dropAuthor: true,
+            });
+          })(),
+          timeoutMs,
+          `batch of ${items.length} items`,
+        );
+        return;
+      } catch (error) {
+        if (error instanceof TransferTimeoutError && client) {
+          this.abandonClient(userId, client);
+        }
+        if (isCancelled()) throw error;
+        const seconds = floodWaitSeconds(error);
+        if (seconds !== undefined) {
+          logger.warn(
+            { userId, batchSize: items.length, waitSeconds: seconds },
+            "Telegram FloodWait; pausing this batch before retry",
+          );
+          if (attempt >= MAX_TRANSFER_ATTEMPTS - 1) throw error;
+          await pause(Math.max(1, seconds) * 1_000);
+          continue;
+        }
+        if (
+          !(error instanceof TransferTimeoutError) &&
+          (!isRetryableTransferError(error) || attempt >= MAX_TRANSFER_ATTEMPTS - 1)
+        ) {
+          throw error;
+        }
+        await pause(retryDelayMs(attempt));
+      }
+    }
+
+    throw new Error(`Batch of ${items.length} items exhausted retries`);
+  }
+
   private abandonClient(userId: number, client: TelegramClient): void {
     if (this.clients.get(userId) !== client) return;
     this.clients.delete(userId);

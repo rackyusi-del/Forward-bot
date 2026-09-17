@@ -27,6 +27,10 @@ transfer speeds use bounded parallel workers and a shorter inter-item delay;
 slower speeds add a longer inter-item delay. Telegram flood-wait responses are
 still respected.
 
+Regular destination chats use Telegram's native multi-message forwarding in
+batches of up to 100 items. Forum-topic destinations keep the single-item path
+so each message is attached to the requested topic correctly.
+
 The language menu supports English, Hindi, Spanish, French, German, Portuguese,
 Arabic, Bengali, Russian and Chinese. User preferences, history, duplicate
 tracking, filters and schedules are stored per Telegram user.
