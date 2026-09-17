@@ -39,6 +39,7 @@ interface PendingInput {
   resolve: (value: string) => void;
 }
 
+
 interface TransferRun {
   cancelled: boolean;
 }
@@ -395,14 +396,13 @@ class ForwardingBot {
     if (normalized === "/stop") {
       const transferRun = this.transferRuns.get(userId);
       if (transferRun) transferRun.cancelled = true;
-      const saveStopState = this.state.setRunning(userId, false);
+      await this.state.setRunning(userId, false);
+      this.userClient.stopTransfer(userId);
       await this.api.sendMessage(
         message.chat.id,
         "Transfer stopped. The active item was kept in the queue. Send /on to continue from here.",
         { threadId: message.message_thread_id },
       );
-      this.userClient.stopTransfer(userId);
-      await saveStopState;
       return true;
     }
 
@@ -854,17 +854,22 @@ class ForwardingBot {
       await this.updateProgress(userId, item);
       try {
         const current = this.state.getUser(userId);
-        await this.userClient.sendItem(
-          userId,
-          current.source!,
-          current.target!,
-          item,
-          () => transferRun.cancelled,
+        await waitForCancellation(
+          this.userClient.sendItem(
+            userId,
+            current.source!,
+            current.target!,
+            item,
+            () => transferRun.cancelled,
+          ),
+          () => transferRun.cancelled || !this.state.getUser(userId).running,
         );
+        if (!this.isCurrentTransferRun(userId, transferRun)) return;
         await this.state.setItemStatus(userId, item.id, "completed");
         await this.state.markItemSent(userId, item);
       } catch (error) {
         const stopped = transferRun.cancelled || !this.state.getUser(userId).running;
+        if (!this.isCurrentTransferRun(userId, transferRun)) return;
         await this.state.setItemStatus(
           userId,
           item.id,
@@ -880,6 +885,10 @@ class ForwardingBot {
       await this.updateProgress(userId);
       await pause(this.transferDelay(speed));
     }
+  }
+
+  private isCurrentTransferRun(userId: number, transferRun: TransferRun): boolean {
+    return this.transferRuns.get(userId) === transferRun;
   }
 
   private transferWorkerCount(speed: number): number {
@@ -1101,4 +1110,31 @@ function formatSpeed(speed: number): string {
 
 function pause(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForCancellation<T>(
+  operation: Promise<T>,
+  isCancelled: () => boolean,
+): Promise<T> {
+  if (isCancelled()) {
+    throw new Error("Transfer was stopped");
+  }
+
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = setInterval(() => {
+          if (isCancelled()) {
+            clearInterval(timer);
+            reject(new Error("Transfer was stopped"));
+          }
+        }, 250);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearInterval(timer);
+  }
 }
