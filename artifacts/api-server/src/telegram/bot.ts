@@ -871,15 +871,17 @@ class ForwardingBot {
     await this.state.setRunning(userId, true);
     const shouldRecordHistory = initial.queue.some((item) => item.status !== "completed");
     try {
-      const progress = await this.api.sendMessage(
+      const progress = await this.sendMessageSafe(
         notifyChatId,
         this.progressText(this.state.getUser(userId), undefined),
-        { threadId: notifyThreadId },
+        notifyThreadId,
       );
-      await this.state.setProgressMessage(userId, {
-        chatId: notifyChatId,
-        messageId: progress.message_id,
-      });
+      if (progress) {
+        await this.state.setProgressMessage(userId, {
+          chatId: notifyChatId,
+          messageId: progress.message_id,
+        });
+      }
 
       const workers = Array.from({ length: MAX_TRANSFER_WORKERS }, (_, workerIndex) =>
         this.processTransferQueue(userId, transferRun, workerIndex),
@@ -906,22 +908,28 @@ class ForwardingBot {
           });
         }
         if (finalUser.notifyOnComplete) {
-          await this.api.sendMessage(notifyChatId, this.summaryText(this.state.getUser(userId)), {
-            threadId: notifyThreadId,
-          });
+          await this.sendMessageSafe(
+            notifyChatId,
+            this.summaryText(this.state.getUser(userId)),
+            notifyThreadId,
+          );
         }
       } else if (!transferRun.cancelled) {
-        await this.api.sendMessage(notifyChatId, "Transfer paused. Completed items are saved; use /resume to continue.", {
-          threadId: notifyThreadId,
-        });
+        await this.sendMessageSafe(
+          notifyChatId,
+          "Transfer paused. Completed items are saved; use /resume to continue.",
+          notifyThreadId,
+        );
       }
     } catch (error) {
       if (!transferRun.cancelled) {
         await this.state.setRunning(userId, false);
         await this.state.setError(userId, safeError(error));
-        await this.api.sendMessage(notifyChatId, `Transfer stopped safely: ${safeError(error)}`, {
-          threadId: notifyThreadId,
-        });
+        await this.sendMessageSafe(
+          notifyChatId,
+          `Transfer stopped safely: ${safeError(error)}`,
+          notifyThreadId,
+        );
       }
     } finally {
       if (this.transferRuns.get(userId) === transferRun) {
@@ -1185,6 +1193,31 @@ class ForwardingBot {
 
   private transferDelay(speed: number): number {
     return speed >= 2 ? 0 : Math.max(0, Math.round(350 / speed));
+  }
+
+  private async sendMessageSafe(
+    chatId: number,
+    text: string,
+    threadId?: number,
+  ): Promise<TelegramMessage | undefined> {
+    try {
+      return await this.api.sendMessage(chatId, text, { threadId });
+    } catch (error) {
+      if (threadId !== undefined) {
+        try {
+          logger.warn(
+            { chatId, threadId, err: error },
+            "Telegram thread notification failed; retrying in chat",
+          );
+          return await this.api.sendMessage(chatId, text);
+        } catch (fallbackError) {
+          logger.warn({ chatId, err: fallbackError }, "Telegram notification failed");
+          return undefined;
+        }
+      }
+      logger.warn({ chatId, err: error }, "Telegram notification failed");
+      return undefined;
+    }
   }
 
   private async updateProgress(userId: number, currentItem?: QueueItem): Promise<void> {
