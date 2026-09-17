@@ -30,9 +30,9 @@ const slowerTransferSpeeds = Array.from({ length: 10 }, (_, index) => (index + 1
 const fasterTransferSpeeds = Array.from({ length: 10 }, (_, index) => index + 1);
 const transferSpeeds = [
   ...slowerTransferSpeeds.map((speed) => ({ speed, icon: "🐢" })),
-  ...fasterTransferSpeeds.map((speed) => ({ speed, icon: "🚀" })),
+  ...fasterTransferSpeeds.map((speed) => ({ speed, icon: "🐇" })),
 ];
-const MAX_TRANSFER_WORKERS = 4;
+const MAX_TRANSFER_WORKERS = 8;
 
 interface PendingInput {
   chatId: number;
@@ -387,7 +387,7 @@ class ForwardingBot {
       }
       await this.api.sendMessage(
         message.chat.id,
-        `${translate(user.language, "transferSpeed", { speed: formatSpeed(user.transferSpeed) })}\n🐢 Slow options: 0.1x–1x\n🚀 Fast options: 1x–10x`,
+        `${translate(user.language, "transferSpeed", { speed: formatSpeed(user.transferSpeed) })}\n🐢 Slow options: 0.1x–1x\n🐇 Fast options: 1x–10x`,
         { replyMarkup: this.transferSpeedKeyboard(this.state.getUser(userId).transferSpeed) },
       );
       return true;
@@ -791,11 +791,9 @@ class ForwardingBot {
         messageId: progress.message_id,
       });
 
-      const speed = this.state.getUser(userId).transferSpeed;
-      const workerCount = this.transferWorkerCount(speed);
       await Promise.all(
-        Array.from({ length: workerCount }, () =>
-          this.processTransferQueue(userId, speed, transferRun),
+        Array.from({ length: MAX_TRANSFER_WORKERS }, (_, workerIndex) =>
+          this.processTransferQueue(userId, transferRun, workerIndex),
         ),
       );
 
@@ -842,11 +840,16 @@ class ForwardingBot {
 
   private async processTransferQueue(
     userId: number,
-    speed: number,
     transferRun: TransferRun,
+    workerIndex: number,
   ): Promise<void> {
     while (!transferRun.cancelled && this.state.getUser(userId).running) {
       const user = this.state.getUser(userId);
+      const speed = user.transferSpeed;
+      if (workerIndex >= this.transferWorkerCount(speed)) {
+        await pause(250);
+        continue;
+      }
       const item = user.queue.find((candidate) => candidate.status === "pending");
       if (!item) return;
 
@@ -883,7 +886,7 @@ class ForwardingBot {
       }
       if (transferRun.cancelled) return;
       await this.updateProgress(userId);
-      await pause(this.transferDelay(speed));
+      await pause(this.transferDelay(this.state.getUser(userId).transferSpeed));
     }
   }
 
@@ -892,7 +895,7 @@ class ForwardingBot {
   }
 
   private transferWorkerCount(speed: number): number {
-    return Math.min(MAX_TRANSFER_WORKERS, Math.max(1, Math.ceil(speed / 3)));
+    return Math.min(MAX_TRANSFER_WORKERS, Math.max(1, Math.ceil(speed)));
   }
 
   private transferDelay(speed: number): number {
