@@ -844,7 +844,7 @@ class ForwardingBot {
     const existingRun = this.transferRuns.get(userId);
     if (existingRun) {
       if (!existingRun.cancelled) return;
-      await existingRun.done;
+      await this.waitForTransferShutdown(userId, existingRun);
     }
     const initial = this.state.getUser(userId);
     if (!initial.authorized || !initial.source || !initial.target || !initial.queue.length) {
@@ -1168,23 +1168,32 @@ class ForwardingBot {
 
     transferRun.cancelled = true;
     await this.state.setRunning(userId, false);
+    await this.waitForTransferShutdown(userId, transferRun);
+  }
+
+  private async waitForTransferShutdown(
+    userId: number,
+    transferRun: TransferRun,
+  ): Promise<void> {
     await this.userClient.stopTransfer(userId);
     const finished = await Promise.race([
       transferRun.done.then(() => true),
       pause(TRANSFER_STOP_WAIT_MS).then(() => false),
     ]);
-    if (finished) {
-      await this.state.recoverProcessing(userId);
-      if (this.transferRuns.get(userId) === transferRun) {
-        this.transferRuns.delete(userId);
-      }
-      return;
+    await this.state.recoverProcessing(userId);
+    if (this.transferRuns.get(userId) === transferRun) {
+      this.transferRuns.delete(userId);
     }
-
-    // Do not delete a live run after an arbitrary timeout. Deleting it allows
-    // /on to start a second worker while the old Telegram request is still
-    // running, which is the source of duplicate sends and stale callbacks.
-    logger.warn({ userId }, "Transfer is still shutting down; keeping run locked");
+    if (!finished) {
+      // GramJS can leave a request unresolved even after disconnect(). The
+      // client has already been removed from TelegramUserClient, and any item
+      // it was sending is marked uncertain above, so releasing this stale run
+      // cannot cause it to be claimed or checkpointed by the next run.
+      logger.warn(
+        { userId },
+        "Transfer shutdown timed out; released stale run after marking active items uncertain",
+      );
+    }
   }
 
   private transferWorkerCount(speed: number): number {
