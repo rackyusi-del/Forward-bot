@@ -103,6 +103,8 @@ export class StateStore {
   private readonly statePath: string;
   private state: PersistedState = emptyState();
   private writeChain: Promise<void> = Promise.resolve();
+  private pendingSnapshot?: string;
+  private saveTimer?: NodeJS.Timeout;
 
   constructor(dataDirectory = process.env.DATA_DIR ?? "./data") {
     this.statePath = path.join(dataDirectory, "forwarder-state.json");
@@ -155,15 +157,46 @@ export class StateStore {
     for (const user of Object.values(this.state.users)) {
       user.updatedAt = this.state.updatedAt;
     }
-    const snapshot = JSON.stringify(this.state, null, 2);
-    this.writeChain = this.writeChain.then(async () => {
-      const directory = path.dirname(this.statePath);
-      await mkdir(directory, { recursive: true });
-      const temporaryPath = `${this.statePath}.tmp`;
-      await writeFile(temporaryPath, snapshot, { encoding: "utf8", mode: 0o600 });
-      await rename(temporaryPath, this.statePath);
-    });
+    this.pendingSnapshot = JSON.stringify(this.state, null, 2);
+    if (this.saveTimer) return;
+
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      const snapshot = this.pendingSnapshot;
+      this.pendingSnapshot = undefined;
+      if (!snapshot) return;
+      this.writeChain = this.writeChain
+        .then(() => this.writeSnapshot(snapshot))
+        .catch((error) => {
+          logger.warn({ err: error }, "Could not persist Telegram state");
+        });
+    }, 250);
+    this.saveTimer.unref?.();
+  }
+
+  async flush(): Promise<void> {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+    }
+    const snapshot = this.pendingSnapshot;
+    this.pendingSnapshot = undefined;
+    if (snapshot) {
+      this.writeChain = this.writeChain
+        .then(() => this.writeSnapshot(snapshot))
+        .catch((error) => {
+          logger.warn({ err: error }, "Could not persist Telegram state");
+        });
+    }
     await this.writeChain;
+  }
+
+  private async writeSnapshot(snapshot: string): Promise<void> {
+    const directory = path.dirname(this.statePath);
+    await mkdir(directory, { recursive: true });
+    const temporaryPath = `${this.statePath}.tmp`;
+    await writeFile(temporaryPath, snapshot, { encoding: "utf8", mode: 0o600 });
+    await rename(temporaryPath, this.statePath);
   }
 
   async setOffset(offset: number) {
@@ -370,7 +403,11 @@ export class StateStore {
     if (!item) return;
     item.status = status;
     item.error = error;
-    await this.save();
+    // Processing is an in-memory lock. Persist only the states needed for
+    // recovery; completed items are persisted by markItemSent().
+    if (status !== "processing" && status !== "completed") {
+      await this.save();
+    }
   }
 
   async setError(userId: number, error: string | undefined) {

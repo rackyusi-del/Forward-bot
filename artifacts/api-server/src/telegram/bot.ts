@@ -32,7 +32,7 @@ const transferSpeeds = [
   ...slowerTransferSpeeds.map((speed) => ({ speed, icon: "🐢" })),
   ...fasterTransferSpeeds.map((speed) => ({ speed, icon: "🐇" })),
 ];
-const MAX_TRANSFER_WORKERS = boundedEnvNumber("MAX_TRANSFER_WORKERS", 2, 1, 3);
+const MAX_TRANSFER_WORKERS = boundedEnvNumber("MAX_TRANSFER_WORKERS", 3, 1, 4);
 const LIVE_POLL_INTERVAL_MS = boundedEnvNumber(
   "LIVE_POLL_INTERVAL_MS",
   15_000,
@@ -48,6 +48,8 @@ interface PendingInput {
 
 interface TransferRun {
   cancelled: boolean;
+  done: Promise<void>;
+  resolveDone: () => void;
 }
 
 export async function startTelegramBot(): Promise<void> {
@@ -70,6 +72,8 @@ class ForwardingBot {
   private readonly pendingInputs = new Map<number, PendingInput>();
   private readonly transferRuns = new Map<number, TransferRun>();
   private readonly scheduleTimers = new Map<number, NodeJS.Timeout>();
+  private readonly lastProgressUpdateAt = new Map<number, number>();
+  private updateChain: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly api: TelegramApi,
@@ -117,6 +121,7 @@ class ForwardingBot {
 
     const stop = () => {
       this.stopping = true;
+      void this.state.flush();
       void this.userClient.disconnectAll();
     };
     process.once("SIGTERM", stop);
@@ -126,9 +131,11 @@ class ForwardingBot {
       try {
         const updates = await this.api.getUpdates(this.state.offset + 1);
         for (const update of updates) {
-          void this.handleUpdate(update).catch((error) => {
-            logger.warn({ err: error, updateId: update.update_id }, "Telegram update failed");
-          });
+          this.updateChain = this.updateChain
+            .then(() => this.handleUpdate(update))
+            .catch((error) => {
+              logger.warn({ err: error, updateId: update.update_id }, "Telegram update failed");
+            });
           await this.state.setOffset(update.update_id);
         }
       } catch (error) {
@@ -789,7 +796,10 @@ class ForwardingBot {
     notifyThreadId?: number,
   ): Promise<void> {
     const existingRun = this.transferRuns.get(userId);
-    if (existingRun && !existingRun.cancelled) return;
+    if (existingRun) {
+      if (!existingRun.cancelled) return;
+      await existingRun.done;
+    }
     const initial = this.state.getUser(userId);
     if (!initial.authorized || !initial.source || !initial.target || !initial.queue.length) {
       await this.api.sendMessage(
@@ -800,7 +810,11 @@ class ForwardingBot {
       return;
     }
 
-    const transferRun: TransferRun = { cancelled: false };
+    let resolveDone!: () => void;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const transferRun: TransferRun = { cancelled: false, done, resolveDone };
     this.transferRuns.set(userId, transferRun);
     await this.state.setRunning(userId, true);
     const shouldRecordHistory = initial.queue.some((item) => item.status !== "completed");
@@ -861,6 +875,7 @@ class ForwardingBot {
       if (this.transferRuns.get(userId) === transferRun) {
         this.transferRuns.delete(userId);
       }
+      transferRun.resolveDone();
     }
   }
 
@@ -983,12 +998,17 @@ class ForwardingBot {
     const user = this.state.getUser(userId);
     const progress = user.progressMessage;
     if (!progress) return;
+    const now = Date.now();
+    const forceUpdate = currentItem === undefined;
+    const lastUpdate = this.lastProgressUpdateAt.get(userId) ?? 0;
+    if (!forceUpdate && now - lastUpdate < 1_500) return;
     try {
       await this.api.editMessageText(
         progress.chatId,
         progress.messageId,
         this.progressText(user, currentItem),
       );
+      this.lastProgressUpdateAt.set(userId, Date.now());
     } catch (error) {
       logger.debug({ userId, err: error }, "Could not edit Telegram progress message");
     }
