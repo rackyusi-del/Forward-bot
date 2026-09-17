@@ -14,11 +14,11 @@ import { itemName, matchesContentType, messageContentType } from "./filter";
 type Prompt = (question: string) => Promise<string>;
 type Progress = (completed: number, total: number, name: string) => Promise<void>;
 type IsCancelled = () => boolean;
-// Large Telegram uploads can legitimately take several minutes. A fixed
-// two-minute deadline makes an otherwise healthy upload look stuck and then
-// disconnects the session in the middle of it. Keep the watchdog opt-in via
-// TRANSFER_ITEM_TIMEOUT_MS; zero means no hard deadline.
-const DEFAULT_TRANSFER_ITEM_TIMEOUT_MS = 0;
+// A Telegram transfer that remains unresolved can otherwise hold a worker
+// forever. The timeout is per attempt; timed-out attempts disconnect the
+// client and retry with a fresh connection. Increase this through
+// TRANSFER_ITEM_TIMEOUT_MS for unusually large files.
+const DEFAULT_TRANSFER_ITEM_TIMEOUT_MS = 120_000;
 const MAX_TRANSFER_ATTEMPTS = 6;
 
 export interface DiscoveryResult {
@@ -168,60 +168,62 @@ export class TelegramUserClient {
     speed = 1,
   ): Promise<void> {
     if (isCancelled()) throw new Error("Transfer was stopped");
-    const client = await this.getClient(userId);
-    try {
-      await withTimeout(
-        (async () => {
-          const sourceEntity = await client.getInputEntity(source.chatId);
-          const targetEntity = await client.getInputEntity(target.chatId);
-          const message = await this.getMessage(client, sourceEntity, item.messageId);
-          if (!message) throw new Error("Source message is no longer available");
+    const timeoutMs = transferItemTimeoutMs();
 
-          for (let attempt = 0; attempt < MAX_TRANSFER_ATTEMPTS; attempt += 1) {
-            try {
-              if (item.type === "messages" && !message.media) {
-                if (!message.message?.trim()) throw new Error("Message has no text");
-                if (isCancelled()) throw new Error("Transfer was stopped");
-                await client.sendMessage(targetEntity, {
-                  message: message.message,
-                  replyTo: target.threadId,
-                });
-              } else if (message.media) {
-                if (isCancelled()) throw new Error("Transfer was stopped");
-                await client.sendFile(targetEntity, {
-                  file: message.media,
-                  caption: message.message || undefined,
-                  forceDocument: item.type === "files",
-                  replyTo: target.threadId,
-                  workers: uploadWorkerCount(speed),
-                });
-              } else {
-                throw new Error("Source media is unavailable");
-              }
-              return;
-            } catch (error) {
-              if (isCancelled()) throw error;
-              const seconds = floodWaitSeconds(error);
-              if (seconds !== undefined) {
-                if (attempt >= MAX_TRANSFER_ATTEMPTS - 1) throw error;
-                await pause(Math.max(1, seconds) * 1_000);
-                continue;
-              }
-              if (!isRetryableTransferError(error) || attempt >= MAX_TRANSFER_ATTEMPTS - 1) {
-                throw error;
-              }
-              await pause(retryDelayMs(attempt));
+    for (let attempt = 0; attempt < MAX_TRANSFER_ATTEMPTS; attempt += 1) {
+      let client: TelegramClient | undefined;
+      try {
+        client = await this.getClient(userId);
+        await withTimeout(
+          (async () => {
+            const sourceEntity = await client!.getInputEntity(source.chatId);
+            const targetEntity = await client!.getInputEntity(target.chatId);
+            const message = await this.getMessage(client!, sourceEntity, item.messageId);
+            if (!message) throw new Error("Source message is no longer available");
+
+            if (item.type === "messages" && !message.media) {
+              if (!message.message?.trim()) throw new Error("Message has no text");
+              if (isCancelled()) throw new Error("Transfer was stopped");
+              await client!.sendMessage(targetEntity, {
+                message: message.message,
+                replyTo: target.threadId,
+              });
+            } else if (message.media) {
+              if (isCancelled()) throw new Error("Transfer was stopped");
+              await client!.sendFile(targetEntity, {
+                file: message.media,
+                caption: message.message || undefined,
+                forceDocument: item.type === "files",
+                replyTo: target.threadId,
+                workers: uploadWorkerCount(speed),
+              });
+            } else {
+              throw new Error("Source media is unavailable");
             }
-          }
-        })(),
-        transferItemTimeoutMs(),
-        item.name,
-      );
-    } catch (error) {
-      if (error instanceof TransferTimeoutError) {
-        this.abandonClient(userId, client);
+          })(),
+          timeoutMs,
+          item.name,
+        );
+        return;
+      } catch (error) {
+        if (error instanceof TransferTimeoutError && client) {
+          this.abandonClient(userId, client);
+        }
+        if (isCancelled()) throw error;
+        const seconds = floodWaitSeconds(error);
+        if (seconds !== undefined) {
+          if (attempt >= MAX_TRANSFER_ATTEMPTS - 1) throw error;
+          await pause(Math.max(1, seconds) * 1_000);
+          continue;
+        }
+        if (
+          !(error instanceof TransferTimeoutError) &&
+          (!isRetryableTransferError(error) || attempt >= MAX_TRANSFER_ATTEMPTS - 1)
+        ) {
+          throw error;
+        }
+        await pause(retryDelayMs(attempt));
       }
-      throw error;
     }
   }
 
