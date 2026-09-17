@@ -17,6 +17,7 @@ MAX_TRANSFER_WORKERS=2
 MAX_UPLOAD_WORKERS=8
 TRANSFER_BATCH_SIZE=100
 LIVE_POLL_INTERVAL_MS=15000
+TRANSFER_STALL_TIMEOUT_MS=600000
 NODE_ENV=production
 LOG_LEVEL=info
 ```
@@ -30,6 +31,9 @@ kept unchanged.
 because they take longer than a fixed number of minutes. The bot retries
 temporary network failures and Telegram FloodWait responses automatically,
 then continues with the next queued item after a permanent item-level error.
+`TRANSFER_STALL_TIMEOUT_MS` is a separate safety watchdog. If a Telegram
+operation stops making progress for that long, the active item is released back
+to `pending`, the run is paused, and `/on` or `/retry` can start it cleanly.
 
 Attach a persistent Railway Volume mounted at `/data`. The bot writes:
 

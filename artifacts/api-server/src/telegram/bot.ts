@@ -42,6 +42,13 @@ const LIVE_POLL_INTERVAL_MS = boundedEnvNumber(
   5_000,
   120_000,
 );
+const TRANSFER_STALL_TIMEOUT_MS = boundedEnvNumber(
+  "TRANSFER_STALL_TIMEOUT_MS",
+  10 * 60_000,
+  60_000,
+  60 * 60_000,
+);
+const TRANSFER_STOP_WAIT_MS = 10_000;
 
 interface PendingInput {
   chatId: number;
@@ -53,6 +60,7 @@ interface TransferRun {
   cancelled: boolean;
   done: Promise<void>;
   resolveDone: () => void;
+  lastActivityAt: number;
 }
 
 export async function startTelegramBot(): Promise<void> {
@@ -226,6 +234,7 @@ class ForwardingBot {
     }
 
     if (command === "/retry" || command === "/retryall") {
+      await this.stopExistingTransfer(userId);
       await this.state.retryFailed(userId);
       await this.api.sendMessage(message.chat.id, translate(user.language, "transferResumed"));
       void this.startTransfer(userId, message.chat.id, message.message_thread_id);
@@ -244,6 +253,7 @@ class ForwardingBot {
     }
 
     if (command === "/logout") {
+      await this.stopExistingTransfer(userId);
       await this.state.setRunning(userId, false);
       await this.userClient.logout(userId);
       await this.state.setAuthorized(userId, false);
@@ -260,12 +270,14 @@ class ForwardingBot {
     }
 
     if (command === "/pause") {
+      await this.stopExistingTransfer(userId);
       await this.state.setRunning(userId, false);
       await this.api.sendMessage(message.chat.id, translate(user.language, "transferPaused"));
       return true;
     }
 
     if (command === "/clear") {
+      await this.stopExistingTransfer(userId);
       await this.state.cancelQueue(userId);
       await this.api.sendMessage(message.chat.id, translate(user.language, "queueCleared"));
       return true;
@@ -428,10 +440,7 @@ class ForwardingBot {
     }
 
     if (normalized === "/stop") {
-      const transferRun = this.transferRuns.get(userId);
-      if (transferRun) transferRun.cancelled = true;
-      await this.state.setRunning(userId, false);
-      this.userClient.stopTransfer(userId);
+      await this.stopExistingTransfer(userId);
       await this.api.sendMessage(
         message.chat.id,
         "Transfer stopped. The active item was kept in the queue. Send /on to continue from here.",
@@ -445,10 +454,7 @@ class ForwardingBot {
         await this.api.sendMessage(message.chat.id, "Use /on in the bot's private chat.");
         return true;
       }
-      if (this.state.getUser(userId).running) {
-        await this.api.sendMessage(message.chat.id, "Transfer is already running.");
-        return true;
-      }
+      await this.stopExistingTransfer(userId);
       await this.state.retryFailed(userId);
       void this.startTransfer(userId, message.chat.id);
       await this.api.sendMessage(message.chat.id, "Transfer is on. Continuing from the saved queue.");
@@ -456,12 +462,14 @@ class ForwardingBot {
     }
 
     if (normalized === "/cancel") {
+      await this.stopExistingTransfer(userId);
       await this.state.cancelQueue(userId);
       await this.api.sendMessage(message.chat.id, translate(user.language, "transferCancelled"));
       return true;
     }
 
     if (normalized === "/reset") {
+      await this.stopExistingTransfer(userId);
       await this.state.reset(userId);
       await this.api.sendMessage(message.chat.id, "Saved source, selection, destination and queue were reset.");
       return true;
@@ -817,7 +825,12 @@ class ForwardingBot {
     const done = new Promise<void>((resolve) => {
       resolveDone = resolve;
     });
-    const transferRun: TransferRun = { cancelled: false, done, resolveDone };
+    const transferRun: TransferRun = {
+      cancelled: false,
+      done,
+      resolveDone,
+      lastActivityAt: Date.now(),
+    };
     this.transferRuns.set(userId, transferRun);
     await this.state.setRunning(userId, true);
     const shouldRecordHistory = initial.queue.some((item) => item.status !== "completed");
@@ -838,6 +851,7 @@ class ForwardingBot {
       await Promise.all([
         ...workers,
         this.watchLiveSource(userId, transferRun, notifyChatId, notifyThreadId),
+        this.watchTransferHealth(userId, transferRun, notifyChatId, notifyThreadId),
       ]);
 
       const finalUser = this.state.getUser(userId);
@@ -906,6 +920,7 @@ class ForwardingBot {
       for (const item of pendingItems) {
         await this.state.setItemStatus(userId, item.id, "processing");
       }
+      transferRun.lastActivityAt = Date.now();
       await this.updateProgress(userId, pendingItems[0]);
       try {
         const current = this.state.getUser(userId);
@@ -944,6 +959,8 @@ class ForwardingBot {
             "Transfer item batch failed",
           );
         }
+      } finally {
+        transferRun.lastActivityAt = Date.now();
       }
       if (transferRun.cancelled) return;
       await this.updateProgress(userId);
@@ -998,6 +1015,67 @@ class ForwardingBot {
         await this.state.setError(userId, safeError(error));
         logger.warn({ userId, err: error }, "Live source poll failed; transfer will continue");
       }
+    }
+  }
+
+  private async watchTransferHealth(
+    userId: number,
+    transferRun: TransferRun,
+    notifyChatId: number,
+    notifyThreadId?: number,
+  ): Promise<void> {
+    while (!transferRun.cancelled && this.state.getUser(userId).running) {
+      await pause(30_000);
+      if (transferRun.cancelled || !this.state.getUser(userId).running) return;
+
+      const user = this.state.getUser(userId);
+      const hasActiveItems = user.queue.some(
+        (item) => item.status === "pending" || item.status === "processing",
+      );
+      if (!hasActiveItems) continue;
+
+      if (Date.now() - transferRun.lastActivityAt <= TRANSFER_STALL_TIMEOUT_MS) {
+        continue;
+      }
+
+      transferRun.cancelled = true;
+      await this.state.recoverProcessing(userId);
+      await this.state.setRunning(userId, false);
+      await this.state.setError(
+        userId,
+        `Transfer watchdog stopped a stalled Telegram operation after ${Math.round(
+          TRANSFER_STALL_TIMEOUT_MS / 60_000,
+        )} minutes`,
+      );
+      this.userClient.stopTransfer(userId);
+      await this.api.sendMessage(
+        notifyChatId,
+        "Transfer got stuck, so I safely released the active item and paused the queue. Send /on or /retry to continue.",
+        { threadId: notifyThreadId },
+      );
+      return;
+    }
+  }
+
+  private async stopExistingTransfer(userId: number): Promise<void> {
+    const transferRun = this.transferRuns.get(userId);
+    if (!transferRun) {
+      await this.state.setRunning(userId, false);
+      await this.state.recoverProcessing(userId);
+      return;
+    }
+
+    transferRun.cancelled = true;
+    await this.state.setRunning(userId, false);
+    this.userClient.stopTransfer(userId);
+    await Promise.race([transferRun.done, pause(TRANSFER_STOP_WAIT_MS)]);
+    await this.state.recoverProcessing(userId);
+
+    // A network library can occasionally outlive its disconnect call. Removing
+    // the run lets /on and /retry start a clean run; old callbacks are guarded
+    // by isCurrentTransferRun before touching queue state.
+    if (this.transferRuns.get(userId) === transferRun) {
+      this.transferRuns.delete(userId);
     }
   }
 

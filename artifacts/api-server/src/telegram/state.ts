@@ -400,6 +400,19 @@ export class StateStore {
     await this.save();
   }
 
+  async recoverProcessing(userId: number) {
+    const user = this.getUser(userId);
+    let changed = false;
+    for (const item of user.queue) {
+      if (item.status === "processing") {
+        item.status = "pending";
+        item.error = undefined;
+        changed = true;
+      }
+    }
+    if (changed) await this.save();
+  }
+
   async setProgressMessage(
     userId: number,
     progressMessage: { chatId: number; messageId: number } | undefined,
