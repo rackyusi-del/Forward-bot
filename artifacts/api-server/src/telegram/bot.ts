@@ -32,7 +32,9 @@ const transferSpeeds = [
   ...slowerTransferSpeeds.map((speed) => ({ speed, icon: "🐢" })),
   ...fasterTransferSpeeds.map((speed) => ({ speed, icon: "🐇" })),
 ];
-const MAX_TRANSFER_WORKERS = boundedEnvNumber("MAX_TRANSFER_WORKERS", 3, 1, 4);
+// Keep account-level concurrency conservative. Telegram may impose a
+// multi-minute FloodWait when several file uploads run in parallel.
+const MAX_TRANSFER_WORKERS = boundedEnvNumber("MAX_TRANSFER_WORKERS", 2, 1, 3);
 const LIVE_POLL_INTERVAL_MS = boundedEnvNumber(
   "LIVE_POLL_INTERVAL_MS",
   15_000,

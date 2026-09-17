@@ -212,6 +212,10 @@ export class TelegramUserClient {
         if (isCancelled()) throw error;
         const seconds = floodWaitSeconds(error);
         if (seconds !== undefined) {
+          logger.warn(
+            { userId, itemId: item.id, waitSeconds: seconds },
+            "Telegram FloodWait; pausing this item before retry",
+          );
           if (attempt >= MAX_TRANSFER_ATTEMPTS - 1) throw error;
           await pause(Math.max(1, seconds) * 1_000);
           continue;
@@ -368,9 +372,9 @@ function pause(milliseconds: number) {
 }
 
 function uploadWorkerCount(speed: number): number {
-  const configured = Number(process.env.MAX_UPLOAD_WORKERS ?? "8");
+  const configured = Number(process.env.MAX_UPLOAD_WORKERS ?? "4");
   const maximum = Number.isFinite(configured)
-    ? Math.min(8, Math.max(1, Math.round(configured)))
-    : 8;
+    ? Math.min(4, Math.max(1, Math.round(configured)))
+    : 4;
   return Math.min(maximum, Math.max(1, Math.ceil(speed)));
 }
