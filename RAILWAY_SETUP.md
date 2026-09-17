@@ -12,9 +12,9 @@ BOT_TOKEN=your_BotFather_token
 API_ID=your_my_telegram_org_api_id
 API_HASH=your_my_telegram_org_api_hash
 DATA_DIR=/data
-TRANSFER_ITEM_TIMEOUT_MS=120000
+TRANSFER_ITEM_TIMEOUT_MS=0
 MAX_TRANSFER_WORKERS=2
-MAX_UPLOAD_WORKERS=4
+MAX_UPLOAD_WORKERS=8
 LIVE_POLL_INTERVAL_MS=15000
 NODE_ENV=production
 LOG_LEVEL=info
@@ -24,6 +24,11 @@ LOG_LEVEL=info
 hardcoded. `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are accepted as backwards
 compatible aliases, but the existing `API_ID` and `API_HASH` values should be
 kept unchanged.
+
+`TRANSFER_ITEM_TIMEOUT_MS=0` is intentional: large uploads are not failed just
+because they take longer than a fixed number of minutes. The bot retries
+temporary network failures and Telegram FloodWait responses automatically,
+then continues with the next queued item after a permanent item-level error.
 
 Attach a persistent Railway Volume mounted at `/data`. The bot writes:
 

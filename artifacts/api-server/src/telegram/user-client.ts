@@ -14,7 +14,12 @@ import { itemName, matchesContentType, messageContentType } from "./filter";
 type Prompt = (question: string) => Promise<string>;
 type Progress = (completed: number, total: number, name: string) => Promise<void>;
 type IsCancelled = () => boolean;
-const DEFAULT_TRANSFER_ITEM_TIMEOUT_MS = 120_000;
+// Large Telegram uploads can legitimately take several minutes. A fixed
+// two-minute deadline makes an otherwise healthy upload look stuck and then
+// disconnects the session in the middle of it. Keep the watchdog opt-in via
+// TRANSFER_ITEM_TIMEOUT_MS; zero means no hard deadline.
+const DEFAULT_TRANSFER_ITEM_TIMEOUT_MS = 0;
+const MAX_TRANSFER_ATTEMPTS = 6;
 
 export interface DiscoveryResult {
   items: QueueItem[];
@@ -172,7 +177,7 @@ export class TelegramUserClient {
           const message = await this.getMessage(client, sourceEntity, item.messageId);
           if (!message) throw new Error("Source message is no longer available");
 
-          for (let attempt = 0; attempt < 4; attempt += 1) {
+          for (let attempt = 0; attempt < MAX_TRANSFER_ATTEMPTS; attempt += 1) {
             try {
               if (item.type === "messages" && !message.media) {
                 if (!message.message?.trim()) throw new Error("Message has no text");
@@ -197,8 +202,15 @@ export class TelegramUserClient {
             } catch (error) {
               if (isCancelled()) throw error;
               const seconds = floodWaitSeconds(error);
-              if (seconds === undefined || attempt >= 3) throw error;
-              await pause(Math.max(1, seconds) * 1_000);
+              if (seconds !== undefined) {
+                if (attempt >= MAX_TRANSFER_ATTEMPTS - 1) throw error;
+                await pause(Math.max(1, seconds) * 1_000);
+                continue;
+              }
+              if (!isRetryableTransferError(error) || attempt >= MAX_TRANSFER_ATTEMPTS - 1) {
+                throw error;
+              }
+              await pause(retryDelayMs(attempt));
             }
           }
         })(),
@@ -290,8 +302,10 @@ function transferItemTimeoutMs(): number {
   const configured = Number(
     process.env.TRANSFER_ITEM_TIMEOUT_MS ?? DEFAULT_TRANSFER_ITEM_TIMEOUT_MS,
   );
-  if (!Number.isFinite(configured)) return DEFAULT_TRANSFER_ITEM_TIMEOUT_MS;
-  return Math.min(30 * 60_000, Math.max(30_000, Math.round(configured)));
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return DEFAULT_TRANSFER_ITEM_TIMEOUT_MS;
+  }
+  return Math.min(24 * 60 * 60_000, Math.max(30_000, Math.round(configured)));
 }
 
 async function withTimeout<T>(
@@ -299,6 +313,8 @@ async function withTimeout<T>(
   timeoutMs: number,
   itemName: string,
 ): Promise<T> {
+  if (timeoutMs <= 0) return operation;
+
   let timer: NodeJS.Timeout | undefined;
   try {
     return await new Promise<T>((resolve, reject) => {
@@ -312,6 +328,25 @@ async function withTimeout<T>(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function retryDelayMs(attempt: number): number {
+  return Math.min(30_000, 2_000 * 2 ** attempt);
+}
+
+function isRetryableTransferError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (
+    /(AUTH_KEY|SESSION_REVOKED|USER_DEACTIVATED|USER_BANNED|CHAT_WRITE_FORBIDDEN|CHAT_ADMIN_REQUIRED|CHANNEL_PRIVATE|PEER_ID_INVALID|MESSAGE_ID_INVALID|MEDIA_EMPTY|MESSAGE_TOO_LONG|FILE_REFERENCE_EXPIRED|not logged in|no longer available)/i.test(
+      message,
+    )
+  ) {
+    return false;
+  }
+
+  return /(TIMEOUT|TIMED OUT|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENETUNREACH|EAI_AGAIN|NETWORK|CONNECTION|UNAVAILABLE|INTERNAL|SERVER|RPC_CALL_FAIL|502|503|504|429)/i.test(
+    message,
+  );
 }
 
 function floodWaitSeconds(error: unknown): number | undefined {
@@ -331,9 +366,9 @@ function pause(milliseconds: number) {
 }
 
 function uploadWorkerCount(speed: number): number {
-  const configured = Number(process.env.MAX_UPLOAD_WORKERS ?? "4");
+  const configured = Number(process.env.MAX_UPLOAD_WORKERS ?? "8");
   const maximum = Number.isFinite(configured)
-    ? Math.min(4, Math.max(1, Math.round(configured)))
-    : 4;
+    ? Math.min(8, Math.max(1, Math.round(configured)))
+    : 8;
   return Math.min(maximum, Math.max(1, Math.ceil(speed)));
 }
