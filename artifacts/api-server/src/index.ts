@@ -23,7 +23,25 @@ app.listen(port, (err) => {
   }
 
   logger.info({ port }, "Server listening");
-  void startTelegramBot().catch((error: unknown) => {
-    logger.error({ err: error }, "Telegram bot failed to start");
-  });
+  void runTelegramBotSupervisor();
 });
+
+async function runTelegramBotSupervisor(): Promise<void> {
+  let retryDelayMs = 5_000;
+
+  while (true) {
+    try {
+      await startTelegramBot();
+      logger.warn("Telegram bot listener exited; restarting it");
+    } catch (error) {
+      logger.error({ err: error }, "Telegram bot listener failed; restarting it");
+    }
+
+    await pause(retryDelayMs);
+    retryDelayMs = Math.min(60_000, retryDelayMs * 2);
+  }
+}
+
+function pause(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}

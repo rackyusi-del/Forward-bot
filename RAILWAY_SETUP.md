@@ -15,9 +15,9 @@ DATA_DIR=/data
 TRANSFER_ITEM_TIMEOUT_MS=0
 MAX_TRANSFER_WORKERS=2
 MAX_UPLOAD_WORKERS=8
-TRANSFER_BATCH_SIZE=100
+TRANSFER_BATCH_SIZE=10
 LIVE_POLL_INTERVAL_MS=15000
-TRANSFER_STALL_TIMEOUT_MS=600000
+TRANSFER_STALL_TIMEOUT_MS=3600000
 NODE_ENV=production
 LOG_LEVEL=info
 ```
@@ -28,9 +28,10 @@ compatible aliases, but the existing `API_ID` and `API_HASH` values should be
 kept unchanged.
 
 `TRANSFER_ITEM_TIMEOUT_MS=0` is intentional: large uploads are not failed just
-because they take longer than a fixed number of minutes. The bot retries
-temporary network failures and Telegram FloodWait responses automatically,
-then continues with the next queued item after a permanent item-level error.
+because they take longer than a fixed number of minutes. A timed-out request
+cannot be safely retried because Telegram may already have accepted it, so the
+bot does not automatically retry a request whose delivery result is unknown.
+The queue checkpoints each item immediately after Telegram confirms it.
 `TRANSFER_STALL_TIMEOUT_MS` is a separate safety watchdog. If a Telegram
 operation stops making progress for that long, the active item is released back
 to `pending`, the run is paused, and `/on` or `/retry` can start it cleanly.

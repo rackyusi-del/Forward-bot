@@ -35,7 +35,9 @@ const transferSpeeds = [
 // Keep account-level concurrency conservative. Telegram may impose a
 // multi-minute FloodWait when several file uploads run in parallel.
 const MAX_TRANSFER_WORKERS = boundedEnvNumber("MAX_TRANSFER_WORKERS", 2, 1, 3);
-const TRANSFER_BATCH_SIZE = boundedEnvNumber("TRANSFER_BATCH_SIZE", 100, 1, 100);
+// Keep a small reservation window. Items are committed one by one below so a
+// slow Telegram request cannot make a large group of items look uncertain.
+const TRANSFER_BATCH_SIZE = boundedEnvNumber("TRANSFER_BATCH_SIZE", 10, 1, 50);
 const LIVE_POLL_INTERVAL_MS = boundedEnvNumber(
   "LIVE_POLL_INTERVAL_MS",
   15_000,
@@ -44,9 +46,9 @@ const LIVE_POLL_INTERVAL_MS = boundedEnvNumber(
 );
 const TRANSFER_STALL_TIMEOUT_MS = boundedEnvNumber(
   "TRANSFER_STALL_TIMEOUT_MS",
-  10 * 60_000,
-  60_000,
   60 * 60_000,
+  60_000,
+  24 * 60 * 60_000,
 );
 const TRANSFER_STOP_WAIT_MS = 10_000;
 
@@ -924,22 +926,33 @@ class ForwardingBot {
       await this.updateProgress(userId, pendingItems[0]);
       try {
         const current = this.state.getUser(userId);
-        await waitForCancellation(
-          this.userClient.sendBatch(
+        // Commit each item immediately after Telegram confirms that item.
+        // A batch-level checkpoint can duplicate every already-delivered item
+        // when the connection fails halfway through a large request.
+        for (const item of pendingItems) {
+          if (transferRun.cancelled || !this.state.getUser(userId).running) return;
+          transferRun.lastActivityAt = Date.now();
+          await this.userClient.sendBatch(
             userId,
             current.source!,
             current.target!,
-            pendingItems,
+            [item],
             () => transferRun.cancelled,
-          ),
-          () => transferRun.cancelled || !this.state.getUser(userId).running,
-        );
-        if (!this.isCurrentTransferRun(userId, transferRun)) return;
-        await this.state.markItemsSent(userId, pendingItems);
+          );
+          if (!this.isCurrentTransferRun(userId, transferRun)) return;
+          await this.state.markItemSent(userId, item);
+          transferRun.lastActivityAt = Date.now();
+        }
       } catch (error) {
         const stopped = transferRun.cancelled || !this.state.getUser(userId).running;
         if (!this.isCurrentTransferRun(userId, transferRun)) return;
-        for (const item of pendingItems) {
+        const remainingItems = pendingItems.filter((item) => {
+          const currentItem = this.state
+            .getUser(userId)
+            .queue.find((candidate) => candidate.id === item.id);
+          return currentItem?.status === "processing";
+        });
+        for (const item of remainingItems) {
           await this.state.setItemStatus(
             userId,
             item.id,
@@ -1047,7 +1060,7 @@ class ForwardingBot {
           TRANSFER_STALL_TIMEOUT_MS / 60_000,
         )} minutes`,
       );
-      this.userClient.stopTransfer(userId);
+      await this.userClient.stopTransfer(userId);
       await this.api.sendMessage(
         notifyChatId,
         "Transfer got stuck, so I safely released the active item and paused the queue. Send /on or /retry to continue.",
@@ -1067,16 +1080,23 @@ class ForwardingBot {
 
     transferRun.cancelled = true;
     await this.state.setRunning(userId, false);
-    this.userClient.stopTransfer(userId);
-    await Promise.race([transferRun.done, pause(TRANSFER_STOP_WAIT_MS)]);
-    await this.state.recoverProcessing(userId);
-
-    // A network library can occasionally outlive its disconnect call. Removing
-    // the run lets /on and /retry start a clean run; old callbacks are guarded
-    // by isCurrentTransferRun before touching queue state.
-    if (this.transferRuns.get(userId) === transferRun) {
-      this.transferRuns.delete(userId);
+    await this.userClient.stopTransfer(userId);
+    const finished = await Promise.race([
+      transferRun.done.then(() => true),
+      pause(TRANSFER_STOP_WAIT_MS).then(() => false),
+    ]);
+    if (finished) {
+      await this.state.recoverProcessing(userId);
+      if (this.transferRuns.get(userId) === transferRun) {
+        this.transferRuns.delete(userId);
+      }
+      return;
     }
+
+    // Do not delete a live run after an arbitrary timeout. Deleting it allows
+    // /on to start a second worker while the old Telegram request is still
+    // running, which is the source of duplicate sends and stale callbacks.
+    logger.warn({ userId }, "Transfer is still shutting down; keeping run locked");
   }
 
   private transferWorkerCount(speed: number): number {

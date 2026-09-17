@@ -14,11 +14,11 @@ import { itemName, matchesContentType, messageContentType } from "./filter";
 type Prompt = (question: string) => Promise<string>;
 type Progress = (completed: number, total: number, name: string) => Promise<void>;
 type IsCancelled = () => boolean;
-// A Telegram transfer that remains unresolved can otherwise hold a worker
-// forever. The timeout is per attempt; timed-out attempts disconnect the
-// client and retry with a fresh connection. Increase this through
-// TRANSFER_ITEM_TIMEOUT_MS for unusually large files.
-const DEFAULT_TRANSFER_ITEM_TIMEOUT_MS = 120_000;
+// A timeout cannot cancel a GramJS request that has already reached Telegram.
+// Therefore the safe default is no artificial per-item timeout. The separate
+// transfer watchdog handles a genuinely stalled run without automatically
+// retrying an operation whose delivery result is unknown.
+const DEFAULT_TRANSFER_ITEM_TIMEOUT_MS = 0;
 const MAX_TRANSFER_ATTEMPTS = 6;
 
 export interface DiscoveryResult {
@@ -94,11 +94,11 @@ export class TelegramUserClient {
     await unlink(this.sessionPath(userId)).catch(() => undefined);
   }
 
-  stopTransfer(userId: number): void {
+  async stopTransfer(userId: number): Promise<void> {
     const client = this.clients.get(userId);
     if (!client) return;
 
-    this.abandonClient(userId, client);
+    await this.abandonClient(userId, client);
   }
 
   async discover(
@@ -209,7 +209,10 @@ export class TelegramUserClient {
         return;
       } catch (error) {
         if (error instanceof TransferTimeoutError && client) {
-          this.abandonClient(userId, client);
+          await this.abandonClient(userId, client);
+          // The request may have reached Telegram before the local timer
+          // fired. Retrying automatically could create a duplicate delivery.
+          throw error;
         }
         if (isCancelled()) throw error;
         const seconds = floodWaitSeconds(error);
@@ -276,7 +279,10 @@ export class TelegramUserClient {
         return;
       } catch (error) {
         if (error instanceof TransferTimeoutError && client) {
-          this.abandonClient(userId, client);
+          await this.abandonClient(userId, client);
+          // The request may have reached Telegram before the local timer
+          // fired. Retrying automatically could create a duplicate delivery.
+          throw error;
         }
         if (isCancelled()) throw error;
         const seconds = floodWaitSeconds(error);
@@ -302,10 +308,10 @@ export class TelegramUserClient {
     throw new Error(`Batch of ${items.length} items exhausted retries`);
   }
 
-  private abandonClient(userId: number, client: TelegramClient): void {
+  private async abandonClient(userId: number, client: TelegramClient): Promise<void> {
     if (this.clients.get(userId) !== client) return;
     this.clients.delete(userId);
-    void client.disconnect().catch((error) => {
+    await client.disconnect().catch((error) => {
       logger.debug({ userId, err: error }, "Telegram transfer client was already disconnected");
     });
   }
@@ -379,9 +385,10 @@ function transferItemTimeoutMs(): number {
   const configured = Number(
     process.env.TRANSFER_ITEM_TIMEOUT_MS ?? DEFAULT_TRANSFER_ITEM_TIMEOUT_MS,
   );
-  if (!Number.isFinite(configured) || configured <= 0) {
+  if (!Number.isFinite(configured) || configured < 0) {
     return DEFAULT_TRANSFER_ITEM_TIMEOUT_MS;
   }
+  if (configured === 0) return 0;
   return Math.min(24 * 60 * 60_000, Math.max(30_000, Math.round(configured)));
 }
 
