@@ -19,6 +19,7 @@ type IsCancelled = () => boolean;
 // client and retry with a fresh connection. Increase this through
 // TRANSFER_ITEM_TIMEOUT_MS for unusually large files.
 const DEFAULT_TRANSFER_ITEM_TIMEOUT_MS = 120_000;
+const MAX_FLOOD_WAIT_MS = 120_000;
 const MAX_TRANSFER_ATTEMPTS = 6;
 
 export interface DiscoveryResult {
@@ -217,7 +218,7 @@ export class TelegramUserClient {
             "Telegram FloodWait; pausing this item before retry",
           );
           if (attempt >= MAX_TRANSFER_ATTEMPTS - 1) throw error;
-          await pause(Math.max(1, seconds) * 1_000);
+          await pause(Math.min(MAX_FLOOD_WAIT_MS, Math.max(1, seconds) * 1_000));
           continue;
         }
         if (
